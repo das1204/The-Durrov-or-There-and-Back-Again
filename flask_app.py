@@ -1,5 +1,6 @@
 import os
 import random
+import time
 import requests
 from flask import Flask, jsonify, request
 from dotenv import load_dotenv
@@ -30,8 +31,36 @@ def parse_chat_mapping(raw_value: str):
 
 CHAT_MAPPING = parse_chat_mapping(os.getenv('CHAT_MAPPING', ''))
 VK_TO_TG = {vk: tg for tg, vk in CHAT_MAPPING.items()}
+SEEN_TG_MESSAGE_IDS = {}
+MAX_SEEN_TG_MESSAGE_IDS = 2000
+DUPLICATE_TTL_SECONDS = 300
 
 app = Flask(__name__)
+
+
+def prune_seen_messages():
+    now = time.time()
+    expired_ids = [msg_id for msg_id, ts in SEEN_TG_MESSAGE_IDS.items() if now - ts > DUPLICATE_TTL_SECONDS]
+    for msg_id in expired_ids:
+        del SEEN_TG_MESSAGE_IDS[msg_id]
+
+    if len(SEEN_TG_MESSAGE_IDS) > MAX_SEEN_TG_MESSAGE_IDS:
+        oldest_ids = sorted(SEEN_TG_MESSAGE_IDS, key=SEEN_TG_MESSAGE_IDS.get)[:len(SEEN_TG_MESSAGE_IDS) - MAX_SEEN_TG_MESSAGE_IDS]
+        for msg_id in oldest_ids:
+            del SEEN_TG_MESSAGE_IDS[msg_id]
+
+
+def mark_seen_tg_message(message_id):
+    if message_id is None:
+        return False
+
+    prune_seen_messages()
+    now = time.time()
+    if message_id in SEEN_TG_MESSAGE_IDS:
+        return True
+
+    SEEN_TG_MESSAGE_IDS[message_id] = now
+    return False
 
 
 def _raise_for_api_error(response, service_name):
@@ -81,6 +110,10 @@ def tg_webhook():
 
     msg = update.get('message')
     if not isinstance(msg, dict):
+        return jsonify({'ok': True})
+
+    message_id = msg.get('message_id')
+    if mark_seen_tg_message(message_id):
         return jsonify({'ok': True})
 
     tg_chat_id = msg.get('chat', {}).get('id')
