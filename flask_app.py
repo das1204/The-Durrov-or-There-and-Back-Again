@@ -1,79 +1,215 @@
-import os, random, requests
-from flask import Flask, request, jsonify
+import os
+import random
+import requests
+from flask import Flask, jsonify, request
 from dotenv import load_dotenv
 
 load_dotenv()
 
-TG_TOKEN = os.getenv('TG_TOKEN')
-VK_TOKEN = os.getenv('VK_TOKEN')
-VK_GROUP_ID = os.getenv('VK_GROUP_ID')
-VK_CONFIRMATION = os.getenv('VK_CONFIRMATION')
+TG_TOKEN = os.getenv('TG_TOKEN', '')
+VK_TOKEN = os.getenv('VK_TOKEN', '')
+VK_GROUP_ID = os.getenv('VK_GROUP_ID', '')
+VK_CONFIRMATION = os.getenv('VK_CONFIRMATION', 'ok')
 
-CHAT_MAPPING = {}
-for pair in os.getenv('CHAT_MAPPING', '').split(','):
-    if ':' in pair:
-        tg_id, vk_id = pair.split(':')
-        CHAT_MAPPING[int(tg_id)] = int(vk_id)
+
+def parse_chat_mapping(raw_value: str):
+    mapping = {}
+    for pair in raw_value.split(','):
+        item = pair.strip()
+        if not item or ':' not in item:
+            continue
+        tg_value, vk_value = item.split(':', 1)
+        try:
+            tg_id = int(tg_value.strip())
+            vk_id = int(vk_value.strip())
+        except ValueError:
+            continue
+        mapping[tg_id] = vk_id
+    return mapping
+
+
+CHAT_MAPPING = parse_chat_mapping(os.getenv('CHAT_MAPPING', ''))
 VK_TO_TG = {vk: tg for tg, vk in CHAT_MAPPING.items()}
 
 app = Flask(__name__)
 
+
+def _raise_for_api_error(response, service_name):
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+
+    if response.status_code >= 400:
+        raise RuntimeError(f'{service_name} HTTP {response.status_code}: {response.text[:200]}')
+    if isinstance(payload, dict) and payload.get('error'):
+        raise RuntimeError(f'{service_name} API error: {payload["error"]}')
+    if isinstance(payload, dict) and payload.get('ok') is False:
+        raise RuntimeError(f'{service_name} API error: {payload}')
+
+    return payload
+
+
+def send_vk_message(vk_user_id, text, attachment=''):
+    payload = {
+        'user_id': vk_user_id,
+        'message': text,
+        'attachment': attachment,
+        'random_id': random.randint(-(2 ** 31), 2 ** 31 - 1),
+        'from_group': 1,
+        'access_token': VK_TOKEN,
+        'v': '5.199',
+    }
+    response = requests.post(
+        'https://api.vk.com/method/messages.send',
+        data=payload,
+        timeout=(5, 15),
+    )
+    data = _raise_for_api_error(response, 'VK messages.send')
+    if data.get('response') is not None and data.get('response') != 1:
+        raise RuntimeError(f'VK messages.send returned unexpected response: {data}')
+    return True
+
+
 @app.route('/tg_webhook', methods=['POST'])
 def tg_webhook():
-    try:
-        update = request.json
-        if 'message' not in update: return jsonify({"ok": True})
-        msg = update['message']
-        tg_chat_id = msg['chat']['id']
-        if tg_chat_id not in CHAT_MAPPING: return jsonify({"ok": True})
-        
-        vk_user_id = CHAT_MAPPING[tg_chat_id]
-        text = msg.get('text') or msg.get('caption') or ""
-        attachment = ""
+    update = request.get_json(silent=True)
+    if not isinstance(update, dict):
+        return jsonify({'ok': True})
+    if 'message' not in update:
+        return jsonify({'ok': True})
 
+    msg = update.get('message')
+    if not isinstance(msg, dict):
+        return jsonify({'ok': True})
+
+    tg_chat_id = msg.get('chat', {}).get('id')
+    if tg_chat_id is None or tg_chat_id not in CHAT_MAPPING:
+        return jsonify({'ok': True})
+
+    vk_user_id = CHAT_MAPPING[tg_chat_id]
+    text = msg.get('text') or msg.get('caption') or ''
+    attachment = ''
+
+    try:
         if 'photo' in msg:
             file_id = msg['photo'][-1]['file_id']
-            file_path = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getFile?file_id={file_id}").json()['result']['file_path']
-            img_data = requests.get(f"https://api.telegram.org/file/bot{TG_TOKEN}/{file_path}").content
-            
-            upload_url = requests.get("https://api.vk.com/method/photos.getMessagesUploadServer", params={"peer_id": vk_user_id, "access_token": VK_TOKEN, "v": "5.199"}).json()['response']['upload_url']
-            upload_resp = requests.post(upload_url, files={'photo': ('img.jpg', img_data, 'image/jpeg')}).json()
-            save_resp = requests.post("https://api.vk.com/method/photos.saveMessagesPhoto", data={"server": upload_resp['server'], "photo": upload_resp['photo'], "hash": upload_resp['hash'], "access_token": VK_TOKEN, "v": "5.199"}).json()['response'][0]
-            attachment = f"photo{save_resp['owner_id']}_{save_resp['id']}"
+            file_response = requests.get(
+                f'https://api.telegram.org/bot{TG_TOKEN}/getFile',
+                params={'file_id': file_id},
+                timeout=(5, 15),
+            )
+            file_data = _raise_for_api_error(file_response, 'Telegram getFile')
+            file_path = file_data['result']['file_path']
 
-        requests.post("https://api.vk.com/method/messages.send", data={"user_id": vk_user_id, "message": text, "attachment": attachment, "random_id": random.randint(-2**31, 2**31-1), "from_group": 1, "access_token": VK_TOKEN, "v": "5.199"})
-    except Exception as e: print(f"Ошибка TG->VK: {e}")
-    return jsonify({"ok": True})
+            img_response = requests.get(
+                f'https://api.telegram.org/file/bot{TG_TOKEN}/{file_path}',
+                timeout=(10, 30),
+            )
+            img_response.raise_for_status()
+            img_data = img_response.content
+
+            upload_server_response = requests.get(
+                'https://api.vk.com/method/photos.getMessagesUploadServer',
+                params={'peer_id': vk_user_id, 'access_token': VK_TOKEN, 'v': '5.199'},
+                timeout=(5, 15),
+            )
+            upload_server_data = _raise_for_api_error(upload_server_response, 'VK getMessagesUploadServer')
+            upload_url = upload_server_data['response']['upload_url']
+
+            upload_response = requests.post(
+                upload_url,
+                files={'photo': ('img.jpg', img_data, 'image/jpeg')},
+                timeout=(10, 30),
+            )
+            upload_payload = _raise_for_api_error(upload_response, 'VK upload photo')
+
+            save_response = requests.post(
+                'https://api.vk.com/method/photos.saveMessagesPhoto',
+                data={
+                    'server': upload_payload['server'],
+                    'photo': upload_payload['photo'],
+                    'hash': upload_payload['hash'],
+                    'access_token': VK_TOKEN,
+                    'v': '5.199',
+                },
+                timeout=(5, 15),
+            )
+            save_data = _raise_for_api_error(save_response, 'VK saveMessagesPhoto')
+            save_item = save_data['response'][0]
+            attachment = f"photo{save_item['owner_id']}_{save_item['id']}"
+
+        send_vk_message(vk_user_id, text, attachment)
+    except Exception as exc:
+        print(f'Ошибка TG->VK: {exc}')
+        return jsonify({'ok': False, 'error': 'telegram_to_vk_failed'}), 500
+
+    return jsonify({'ok': True})
+
 
 @app.route('/vk_callback', methods=['POST'])
 def vk_callback():
-    data = request.json
-    if data.get('type') == 'confirmation': return VK_CONFIRMATION
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'ok': True})
+
+    if data.get('type') == 'confirmation':
+        return VK_CONFIRMATION
+
     try:
         if data.get('type') == 'message_new':
-            msg = data['object']['message']
-            vk_user_id = msg['from_id']
-            if vk_user_id not in VK_TO_TG: return jsonify({"ok": True})
-            
+            msg = data.get('object', {}).get('message')
+            if not isinstance(msg, dict):
+                return jsonify({'ok': True})
+
+            vk_user_id = msg.get('from_id')
+            if vk_user_id is None or vk_user_id not in VK_TO_TG:
+                return jsonify({'ok': True})
+
             tg_chat_id = VK_TO_TG[vk_user_id]
             text = msg.get('text', '')
             photo_url = None
             if 'attachments' in msg:
-                for att in msg['attachments']:
-                    if att['type'] == 'photo':
+                for att in msg.get('attachments', []):
+                    if att.get('type') == 'photo':
                         photo_url = max(att['photo']['sizes'], key=lambda x: x['width'] * x['height'])['url']
                         break
 
             if photo_url:
-                requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto", json={"chat_id": tg_chat_id, "photo": photo_url, "caption": f"🔵 ВК: {text}" if text else None})
+                response = requests.post(
+                    f'https://api.telegram.org/bot{TG_TOKEN}/sendPhoto',
+                    json={
+                        'chat_id': tg_chat_id,
+                        'photo': photo_url,
+                        'caption': text if text else None,
+                    },
+                    timeout=(5, 15),
+                )
+                _raise_for_api_error(response, 'Telegram sendPhoto')
             elif text:
-                requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", json={"chat_id": tg_chat_id, "text": f"🔵 ВК: {text}"})
-    except Exception as e: print(f"Ошибка VK->TG: {e}")
-    return jsonify({"ok": True})
+                response = requests.post(
+                    f'https://api.telegram.org/bot{TG_TOKEN}/sendMessage',
+                    json={'chat_id': tg_chat_id, 'text': text},
+                    timeout=(5, 15),
+                )
+                _raise_for_api_error(response, 'Telegram sendMessage')
+    except Exception as exc:
+        print(f'Ошибка VK->TG: {exc}')
+        return jsonify({'ok': False, 'error': 'vk_to_telegram_failed'}), 500
+
+    return jsonify({'ok': True})
+
+
+@app.route('/healthz')
+def healthz():
+    return jsonify({'status': 'ok', 'chat_pairs': len(CHAT_MAPPING)})
+
 
 @app.route('/')
-def index(): return "✅ Бот-мост работает!"
+def index():
+    return '✅ Бот-мост работает!'
+
 
 if __name__ == '__main__':
-    print(f"🚀 Запуск. Привязано чатов: {len(CHAT_MAPPING)}")
+    print(f'🚀 Запуск. Привязано чатов: {len(CHAT_MAPPING)}')
     app.run(host='0.0.0.0', port=5000, debug=False)
