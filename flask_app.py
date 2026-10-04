@@ -1,9 +1,13 @@
+import logging
 import os
 import random
 import time
 import requests
 from flask import Flask, jsonify, request
 from dotenv import load_dotenv
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -32,34 +36,34 @@ def parse_chat_mapping(raw_value: str):
 CHAT_MAPPING = parse_chat_mapping(os.getenv('CHAT_MAPPING', ''))
 VK_TO_TG = {vk: tg for tg, vk in CHAT_MAPPING.items()}
 SEEN_TG_MESSAGE_IDS = {}
-MAX_SEEN_TG_MESSAGE_IDS = 2000
+SEEN_VK_MESSAGE_IDS = {}
+MAX_SEEN_MESSAGE_IDS = 2000
 DUPLICATE_TTL_SECONDS = 300
 
 app = Flask(__name__)
 
 
-def prune_seen_messages():
+def prune_seen_messages(store):
     now = time.time()
-    expired_ids = [msg_id for msg_id, ts in SEEN_TG_MESSAGE_IDS.items() if now - ts > DUPLICATE_TTL_SECONDS]
-    for msg_id in expired_ids:
-        del SEEN_TG_MESSAGE_IDS[msg_id]
+    expired_ids = [key for key, ts in store.items() if now - ts > DUPLICATE_TTL_SECONDS]
+    for key in expired_ids:
+        del store[key]
 
-    if len(SEEN_TG_MESSAGE_IDS) > MAX_SEEN_TG_MESSAGE_IDS:
-        oldest_ids = sorted(SEEN_TG_MESSAGE_IDS, key=SEEN_TG_MESSAGE_IDS.get)[:len(SEEN_TG_MESSAGE_IDS) - MAX_SEEN_TG_MESSAGE_IDS]
-        for msg_id in oldest_ids:
-            del SEEN_TG_MESSAGE_IDS[msg_id]
+    if len(store) > MAX_SEEN_MESSAGE_IDS:
+        oldest_ids = sorted(store, key=store.get)[:len(store) - MAX_SEEN_MESSAGE_IDS]
+        for key in oldest_ids:
+            del store[key]
 
 
-def mark_seen_tg_message(message_id):
-    if message_id is None:
+def mark_seen_message(store, dedupe_key):
+    if dedupe_key is None:
         return False
 
-    prune_seen_messages()
-    now = time.time()
-    if message_id in SEEN_TG_MESSAGE_IDS:
+    prune_seen_messages(store)
+    if dedupe_key in store:
         return True
 
-    SEEN_TG_MESSAGE_IDS[message_id] = now
+    store[dedupe_key] = time.time()
     return False
 
 
@@ -77,6 +81,27 @@ def _raise_for_api_error(response, service_name):
         raise RuntimeError(f'{service_name} API error: {payload}')
 
     return payload
+
+
+def require_bridge_config():
+    missing = []
+    if not TG_TOKEN:
+        missing.append('TG_TOKEN')
+    if not VK_TOKEN:
+        missing.append('VK_TOKEN')
+    if not CHAT_MAPPING:
+        missing.append('CHAT_MAPPING')
+    if missing:
+        raise RuntimeError(f'Missing required config: {", ".join(missing)}')
+
+
+def safe_dict_get(mapping, *path):
+    current = mapping
+    for key in path:
+        if not isinstance(current, dict) or key not in current:
+            return None
+        current = current[key]
+    return current
 
 
 def send_vk_message(vk_user_id, text, attachment=''):
@@ -102,6 +127,12 @@ def send_vk_message(vk_user_id, text, attachment=''):
 
 @app.route('/tg_webhook', methods=['POST'])
 def tg_webhook():
+    try:
+        require_bridge_config()
+    except RuntimeError as exc:
+        logger.warning(str(exc))
+        return jsonify({'ok': False, 'error': 'bridge_not_configured'}), 503
+
     update = request.get_json(silent=True)
     if not isinstance(update, dict):
         return jsonify({'ok': True})
@@ -112,12 +143,13 @@ def tg_webhook():
     if not isinstance(msg, dict):
         return jsonify({'ok': True})
 
-    message_id = msg.get('message_id')
-    if mark_seen_tg_message(message_id):
-        return jsonify({'ok': True})
-
     tg_chat_id = msg.get('chat', {}).get('id')
     if tg_chat_id is None or tg_chat_id not in CHAT_MAPPING:
+        return jsonify({'ok': True})
+
+    message_id = msg.get('message_id')
+    dedupe_key = (tg_chat_id, message_id) if message_id is not None else None
+    if mark_seen_message(SEEN_TG_MESSAGE_IDS, dedupe_key):
         return jsonify({'ok': True})
 
     vk_user_id = CHAT_MAPPING[tg_chat_id]
@@ -126,14 +158,23 @@ def tg_webhook():
 
     try:
         if 'photo' in msg:
-            file_id = msg['photo'][-1]['file_id']
+            photo_list = msg.get('photo') or []
+            if not photo_list:
+                raise RuntimeError('Telegram photo payload is empty')
+
+            file_id = photo_list[-1].get('file_id')
+            if not file_id:
+                raise RuntimeError('Missing Telegram file_id in photo payload')
+
             file_response = requests.get(
                 f'https://api.telegram.org/bot{TG_TOKEN}/getFile',
                 params={'file_id': file_id},
                 timeout=(5, 15),
             )
             file_data = _raise_for_api_error(file_response, 'Telegram getFile')
-            file_path = file_data['result']['file_path']
+            file_path = safe_dict_get(file_data, 'result', 'file_path')
+            if not file_path:
+                raise RuntimeError(f'Telegram getFile returned unexpected payload: {file_data}')
 
             img_response = requests.get(
                 f'https://api.telegram.org/file/bot{TG_TOKEN}/{file_path}',
@@ -148,7 +189,9 @@ def tg_webhook():
                 timeout=(5, 15),
             )
             upload_server_data = _raise_for_api_error(upload_server_response, 'VK getMessagesUploadServer')
-            upload_url = upload_server_data['response']['upload_url']
+            upload_url = safe_dict_get(upload_server_data, 'response', 'upload_url')
+            if not upload_url:
+                raise RuntimeError(f'VK upload server response missing upload_url: {upload_server_data}')
 
             upload_response = requests.post(
                 upload_url,
@@ -160,16 +203,19 @@ def tg_webhook():
             save_response = requests.post(
                 'https://api.vk.com/method/photos.saveMessagesPhoto',
                 data={
-                    'server': upload_payload['server'],
-                    'photo': upload_payload['photo'],
-                    'hash': upload_payload['hash'],
+                    'server': safe_dict_get(upload_payload, 'server'),
+                    'photo': safe_dict_get(upload_payload, 'photo'),
+                    'hash': safe_dict_get(upload_payload, 'hash'),
                     'access_token': VK_TOKEN,
                     'v': '5.199',
                 },
                 timeout=(5, 15),
             )
             save_data = _raise_for_api_error(save_response, 'VK saveMessagesPhoto')
-            save_item = save_data['response'][0]
+            save_items = safe_dict_get(save_data, 'response')
+            if not isinstance(save_items, list) or not save_items:
+                raise RuntimeError(f'VK saveMessagesPhoto returned unexpected payload: {save_data}')
+            save_item = save_items[0]
             attachment = f"photo{save_item['owner_id']}_{save_item['id']}"
 
         send_vk_message(vk_user_id, text, attachment)
@@ -182,6 +228,12 @@ def tg_webhook():
 
 @app.route('/vk_callback', methods=['POST'])
 def vk_callback():
+    try:
+        require_bridge_config()
+    except RuntimeError as exc:
+        logger.warning(str(exc))
+        return jsonify({'ok': False, 'error': 'bridge_not_configured'}), 503
+
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({'ok': True})
@@ -197,6 +249,11 @@ def vk_callback():
 
             vk_user_id = msg.get('from_id')
             if vk_user_id is None or vk_user_id not in VK_TO_TG:
+                return jsonify({'ok': True})
+
+            message_id = msg.get('id') or data.get('event_id')
+            dedupe_key = (vk_user_id, message_id) if message_id is not None else None
+            if mark_seen_message(SEEN_VK_MESSAGE_IDS, dedupe_key):
                 return jsonify({'ok': True})
 
             tg_chat_id = VK_TO_TG[vk_user_id]
@@ -235,7 +292,13 @@ def vk_callback():
 
 @app.route('/healthz')
 def healthz():
-    return jsonify({'status': 'ok', 'chat_pairs': len(CHAT_MAPPING)})
+    configured = bool(TG_TOKEN and VK_TOKEN and CHAT_MAPPING)
+    status_code = 200 if configured else 503
+    return jsonify({
+        'status': 'ok' if configured else 'misconfigured',
+        'chat_pairs': len(CHAT_MAPPING),
+        'configured': configured,
+    }), status_code
 
 
 @app.route('/')
