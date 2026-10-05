@@ -540,7 +540,7 @@ def _handle_telegram_message(message, event_id):
         reply('Поддерживаются текст, фотографии, видео, GIF и документы.')
         return
     current_selection = storage.get_forum_contact(message_thread_id)
-    Invoke-RestMethod "https://api.telegram.org/bot$env:TG_TOKEN/getChat?chat_id=@имя_группы"    if current_selection is None or current_selection['vk_user_id'] != selected['vk_user_id']:
+    if current_selection is None or current_selection['vk_user_id'] != selected['vk_user_id']:
         reply('Согласие или привязка темы изменились. Проверьте подключение VK-собеседника.')
         return
     send_vk_message(selected['vk_user_id'], text, attachment, event_id=f'tg:{event_id}')
