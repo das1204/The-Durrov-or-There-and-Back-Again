@@ -518,10 +518,8 @@ def _handle_telegram_message(message, event_id):
             )
             reply('Фотография превышает лимит 10 МБ.')
             return
-        image_content_type = image_content_type or ''
-        if not image_content_type.startswith('image/'):
-            reply('Поддерживаются только фотографии.')
-            return
+        if not isinstance(image_content_type, str) or not image_content_type.startswith('image/'):
+            image_content_type = 'image/jpeg'
 
         upload_server_response = _request(
             'VK photos.getMessagesUploadServer', 'GET', 'https://api.vk.com/method/photos.getMessagesUploadServer',
