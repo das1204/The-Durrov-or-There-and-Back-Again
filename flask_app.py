@@ -303,6 +303,11 @@ def _handle_telegram_callback(callback):
     actor_id = safe_dict_get(callback, 'from', 'id')
     chat_id = safe_dict_get(callback, 'message', 'chat', 'id')
     if actor_id != _owner_id() or chat_id != _owner_id():
+        logger.info(
+            'Ignoring Telegram callback: actor_is_owner=%s, chat_is_owner=%s',
+            actor_id == _owner_id(),
+            chat_id == _owner_id(),
+        )
         return
     callback_data = callback.get('data', '')
     if not isinstance(callback_data, str) or not callback_data.startswith('select:'):
@@ -334,13 +339,35 @@ def _handle_telegram_message(message, event_id):
     chat = message.get('chat')
     sender = message.get('from')
     if not isinstance(chat, dict) or not isinstance(sender, dict):
+        logger.warning(
+            'Ignoring Telegram update %s without a valid message chat or sender',
+            event_id,
+        )
         return
     owner_id = _owner_id()
-    if chat.get('type') != 'private' or chat.get('id') != owner_id or sender.get('id') != owner_id:
+    is_private_chat = chat.get('type') == 'private'
+    chat_is_owner = chat.get('id') == owner_id
+    sender_is_owner = sender.get('id') == owner_id
+    if not is_private_chat or not chat_is_owner or not sender_is_owner:
+        logger.info(
+            'Ignoring Telegram message %s: private_chat=%s, chat_is_owner=%s, sender_is_owner=%s',
+            event_id,
+            is_private_chat,
+            chat_is_owner,
+            sender_is_owner,
+        )
         return
 
     text = message.get('text') or message.get('caption') or ''
     command = _command(message.get('text'))
+    logger.info(
+        'Processing Telegram message %s: command=%s, has_text=%s, has_photo=%s, has_document=%s',
+        event_id,
+        command or 'none',
+        bool(text),
+        'photo' in message,
+        'document' in message,
+    )
     if command in {'/start', '/help'}:
         send_telegram_message(owner_id, 'Используйте /list для выбора VK-собеседника и /stop для завершения диалога.')
         return
@@ -406,6 +433,7 @@ def _handle_telegram_message(message, event_id):
             f'https://api.telegram.org/file/bot{TG_TOKEN}/{file_path}', timeout=(10, 30)
         )
         image_response.raise_for_status()
+        image_content_type = image_response.headers.get('Content-Type', '').split(';', 1)[0]
         image_data = image_response.content
         if len(image_data) > MAX_PHOTO_BYTES:
             send_telegram_message(owner_id, 'Фотография превышает лимит 10 МБ.')
@@ -513,6 +541,11 @@ def _handle_telegram_update(update, event_id):
     message = update.get('message')
     if isinstance(message, dict):
         _handle_telegram_message(message, event_id)
+        return
+    logger.info(
+        'Ignoring unsupported Telegram update %s: keys=%s', event_id,
+        ','.join(sorted(key for key in update if isinstance(key, str)))
+    )
 
 
 def _verify_telegram_webhook():
@@ -523,6 +556,7 @@ def _verify_telegram_webhook():
 @app.route('/tg_webhook', methods=['POST'])
 def tg_webhook():
     if not _verify_telegram_webhook():
+        logger.warning('Rejected Telegram webhook request: secret token mismatch')
         return jsonify({'ok': False, 'error': 'unauthorized'}), 403
     try:
         require_bridge_config()
@@ -532,8 +566,13 @@ def tg_webhook():
 
     update = request.get_json(silent=True)
     if not isinstance(update, dict) or not isinstance(update.get('update_id'), int):
+        logger.warning('Rejected Telegram webhook request: invalid update payload')
         return jsonify({'ok': False, 'error': 'invalid_payload'}), 400
     event_id = str(update['update_id'])
+    logger.info(
+        'Received Telegram webhook update %s: keys=%s', event_id,
+        ','.join(sorted(key for key in update if isinstance(key, str)))
+    )
     try:
         ensure_database()
         event_claim = storage.claim_event('telegram', event_id)
@@ -547,10 +586,7 @@ def tg_webhook():
         try:
             storage.finish_event('telegram', event_id, 'failed')
         except Exception:
-            logger.exception(
-                'Failed to mark Telegram webhook event %s as failed',
-                event_id,
-            )
+            logger.exception('Failed to mark Telegram webhook event %s as failed', event_id)
         logger.exception('Telegram webhook processing failed (event_id=%s)', event_id)
         return jsonify({'ok': False, 'error': 'telegram_to_vk_failed'}), 500
     return jsonify({'ok': True})
