@@ -452,6 +452,43 @@ def _command(text):
     return text.strip().split(maxsplit=1)[0].split('@', 1)[0].lower()
 
 
+def _telegram_forward_source(message):
+    origin = message.get('forward_origin')
+    source_chat = None
+    source_message_id = None
+    if isinstance(origin, dict):
+        if origin.get('type') == 'channel':
+            source_chat = origin.get('chat')
+            source_message_id = origin.get('message_id')
+        elif origin.get('type') == 'chat':
+            source_chat = origin.get('sender_chat')
+    if not isinstance(source_chat, dict):
+        source_chat = message.get('forward_from_chat')
+        source_message_id = message.get('forward_from_message_id')
+    if not isinstance(source_chat, dict):
+        source_chat = message.get('sender_chat')
+        source_message_id = message.get('message_id')
+    if not isinstance(source_chat, dict):
+        return None
+
+    title = source_chat.get('title')
+    username = source_chat.get('username')
+    if not isinstance(title, str) or not title.strip():
+        title = f'@{username}' if isinstance(username, str) else ''
+    if not title:
+        return None
+
+    if isinstance(username, str) and re.fullmatch(r'[A-Za-z0-9_]{5,32}', username):
+        source_url = f'https://t.me/{username}'
+    else:
+        chat_id = source_chat.get('id')
+        chat_id_text = str(chat_id) if isinstance(chat_id, int) else ''
+        if not chat_id_text.startswith('-100') or not isinstance(source_message_id, int):
+            return None
+        source_url = f'https://t.me/c/{chat_id_text[4:]}/{source_message_id}'
+    return f'{title.strip()} ({source_url})'
+
+
 def _owner_id():
     try:
         return int(TG_OWNER_ID)
@@ -559,6 +596,10 @@ def _handle_telegram_message(message, event_id):
     if len(text) > MAX_MESSAGE_LENGTH:
         reply('Сообщение слишком длинное. Максимум 3500 символов.')
         return
+    forward_source = _telegram_forward_source(message)
+    if forward_source:
+        source_suffix = f'Источник: {forward_source}'
+        text = f'{text}\n\n{source_suffix}' if text else source_suffix
     if not storage.reserve_outbound_message(owner_id):
         logger.warning(
             'Outbound rate limit reached: provider=telegram event_id=%s owner_id=%s', event_id, owner_id
@@ -743,6 +784,31 @@ def _vk_display_name(vk_user_id):
     return 'Пользователь VK'
 
 
+def _vk_group_source(group_id):
+    name = 'Сообщество VK'
+    source_url = f'https://vk.com/club{group_id}'
+    try:
+        response = _request(
+            'VK groups.getById', 'GET', 'https://api.vk.com/method/groups.getById',
+            params={'group_ids': group_id, 'access_token': VK_TOKEN, 'v': '5.199'}, timeout=(5, 15)
+        )
+        data = _raise_for_api_error(response, 'VK groups.getById')
+        groups = safe_dict_get(data, 'response')
+        if isinstance(groups, dict):
+            groups = groups.get('groups', [groups])
+        if isinstance(groups, list) and groups and isinstance(groups[0], dict):
+            group = groups[0]
+            group_name = group.get('name')
+            if isinstance(group_name, str) and group_name.strip():
+                name = ' '.join(group_name.split())[:80]
+            screen_name = group.get('screen_name')
+            if isinstance(screen_name, str) and re.fullmatch(r'[A-Za-z0-9_.]+', screen_name):
+                source_url = f'https://vk.com/{screen_name}'
+    except Exception:
+        _log_exception('Failed to resolve VK community source group_id=%s; using fallback', group_id)
+    return name, source_url
+
+
 def _vk_send_id(event_id, suffix='reply'):
     return f'vk:{event_id}:{suffix}'
 
@@ -816,13 +882,43 @@ def _handle_vk_message(message, event_id):
     photo_urls = []
     media_files = []
     video_links = []
+    wall_sources = {}
     unsupported_attachment = False
     attachments = message.get('attachments', [])
+    wall_texts = []
     if isinstance(attachments, list):
-        for item in attachments:
+        attachments_to_process = list(attachments)
+        attachment_index = 0
+        while attachment_index < len(attachments_to_process):
+            item = attachments_to_process[attachment_index]
+            attachment_index += 1
             if not isinstance(item, dict):
                 continue
             attachment_type = item.get('type')
+            if attachment_type == 'wall':
+                wall = item.get('wall')
+                if not isinstance(wall, dict):
+                    unsupported_attachment = True
+                    continue
+                wall_text = wall.get('text')
+                if isinstance(wall_text, str) and wall_text.strip():
+                    wall_texts.append(wall_text.strip())
+                wall_owner_id = wall.get('owner_id', wall.get('from_id'))
+                if isinstance(wall_owner_id, int) and wall_owner_id < 0:
+                    group_id = abs(wall_owner_id)
+                    if group_id not in wall_sources:
+                        wall_sources[group_id] = _vk_group_source(group_id)
+                wall_attachments = wall.get('attachments')
+                if isinstance(wall_attachments, list):
+                    attachments_to_process.extend(wall_attachments)
+                copy_history = wall.get('copy_history')
+                if isinstance(copy_history, list):
+                    attachments_to_process.extend(
+                        {'type': 'wall', 'wall': copied_post}
+                        for copied_post in copy_history
+                        if isinstance(copied_post, dict)
+                    )
+                continue
             if attachment_type == 'photo':
                 sizes = safe_dict_get(item, 'photo', 'sizes')
                 if not isinstance(sizes, list):
@@ -873,9 +969,17 @@ def _handle_vk_message(message, event_id):
             )
             unsupported_attachment = True
 
+    if wall_texts:
+        wall_text = '\n\n'.join(wall_texts)
+        text = f'{text}\n\n{wall_text}' if text else wall_text
     if video_links:
         links = '\n'.join(video_links)
         text = f'{text}\n{links}' if text else links
+    source_attribution = ''
+    if wall_sources:
+        sources = '; '.join(f'{name} ({source_url})' for name, source_url in wall_sources.values())
+        source_attribution = f'Источник: {sources}'
+        text = f'{text}\n\n{source_attribution}' if text else source_attribution
     if unsupported_attachment:
         notify_owner('Часть вложений VK пропущена: поддерживаются фотографии, видео, GIF и документы.')
     if not text and not photo_urls and not media_files:
@@ -890,7 +994,13 @@ def _handle_vk_message(message, event_id):
         return
 
     if len(text) > MAX_MESSAGE_LENGTH:
-        text = text[:MAX_MESSAGE_LENGTH]
+        if source_attribution:
+            text_before_attribution = text[:-len(source_attribution)].rstrip()
+            separator = '\n\n' if text_before_attribution else ''
+            max_content_length = MAX_MESSAGE_LENGTH - len(source_attribution) - len(separator)
+            text = f'{text_before_attribution[:max(0, max_content_length)]}{separator}{source_attribution}'
+        else:
+            text = text[:MAX_MESSAGE_LENGTH]
     caption_sent = False
     if photo_urls:
         for start in range(0, len(photo_urls), 10):
