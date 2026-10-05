@@ -90,18 +90,16 @@ def stable_vk_random_id(event_id):
 
 def send_vk_message(vk_user_id, text, attachment='', event_id=None):
     payload = {
-        'user_id': vk_user_id,
-        'message': text,
-        'attachment': attachment,
-        'random_id': stable_vk_random_id(event_id) if event_id is not None else random.randint(1, 2 ** 31 - 1),
-        'from_group': 1,
+        'user_id':      vk_user_id,
+        'message':      text,
+        'attachment':   attachment,
+        'random_id':    stable_vk_random_id(event_id) if event_id is not None else random.randint(1, 2 ** 31 - 1),
+        'from_group':   1,
         'access_token': VK_TOKEN,
-        'v': '5.199',
+        'v':            '5.199'
     }
     response = requests.post(
-        'https://api.vk.com/method/messages.send',
-        data=payload,
-        timeout=(5, 15),
+        'https://api.vk.com/method/messages.send', data=payload, timeout=(5, 15)
     )
     data = _raise_for_api_error(response, 'VK messages.send')
     sent_message_id = data.get('response') if isinstance(data, dict) else None
@@ -273,8 +271,7 @@ def send_telegram_message(chat_id, text, reply_markup=None):
         payload['reply_markup'] = reply_markup
     response = requests.post(
         f'https://api.telegram.org/bot{TG_TOKEN}/sendMessage',
-        json=payload,
-        timeout=(5, 15),
+        json=payload, timeout=(5, 15)
     )
     _raise_for_api_error(response, 'Telegram sendMessage')
 
@@ -353,8 +350,7 @@ def _handle_telegram_message(message, event_id):
             send_telegram_message(owner_id, 'Пока нет согласившихся VK-пользователей. Они должны отправить сообществу /connect.')
             return
         keyboard = [
-            [{'text': item['display_name'], 'callback_data': f"select:{item['vk_user_id']}"}]
-            for item in contacts[:90]
+            [{'text': item['display_name'], 'callback_data': f"select:{item['vk_user_id']}"}] for item in contacts[:90]
         ]
         send_telegram_message(owner_id, 'Выберите VK-собеседника:', {'inline_keyboard': keyboard})
         return
@@ -398,11 +394,20 @@ def _handle_telegram_message(message, event_id):
         if not isinstance(file_id, str) or not file_id:
             send_telegram_message(owner_id, 'Не удалось обработать фотографию.')
             return
-        try:
-            image_data, image_content_type = _download_telegram_file(
-                file_id, MAX_PHOTO_BYTES
-            )
-        except ValueError:
+        file_response = requests.get(
+            f'https://api.telegram.org/bot{TG_TOKEN}/getFile',
+            params={'file_id': file_id}, timeout=(5, 15)
+        )
+        file_data = _raise_for_api_error(file_response, 'Telegram getFile')
+        file_path = safe_dict_get(file_data, 'result', 'file_path')
+        if not isinstance(file_path, str) or not file_path:
+            raise RuntimeError('Telegram getFile returned an invalid file path')
+        image_response = requests.get(
+            f'https://api.telegram.org/file/bot{TG_TOKEN}/{file_path}', timeout=(10, 30)
+        )
+        image_response.raise_for_status()
+        image_data = image_response.content
+        if len(image_data) > MAX_PHOTO_BYTES:
             send_telegram_message(owner_id, 'Фотография превышает лимит 10 МБ.')
             return
         if not image_content_type.startswith('image/'):
@@ -427,11 +432,11 @@ def _handle_telegram_message(message, event_id):
         save_response = requests.post(
             'https://api.vk.com/method/photos.saveMessagesPhoto',
             data={
-                'server': safe_dict_get(upload_payload, 'server'),
-                'photo': safe_dict_get(upload_payload, 'photo'),
-                'hash': safe_dict_get(upload_payload, 'hash'),
+                'server':       safe_dict_get(upload_payload, 'server'),
+                'photo':        safe_dict_get(upload_payload, 'photo'),
+                'hash':         safe_dict_get(upload_payload, 'hash'),
                 'access_token': VK_TOKEN,
-                'v': '5.199',
+                'v':            '5.199'
             },
             timeout=(5, 15),
         )
@@ -556,7 +561,7 @@ def _vk_display_name(vk_user_id):
         response = requests.get(
             'https://api.vk.com/method/users.get',
             params={'user_ids': vk_user_id, 'access_token': VK_TOKEN, 'v': '5.199'},
-            timeout=(5, 15),
+            timeout=(5, 15)
         )
         data = _raise_for_api_error(response, 'VK users.get')
         users = safe_dict_get(data, 'response')
@@ -587,7 +592,7 @@ def _handle_vk_message(message, event_id):
         send_vk_message(
             vk_user_id,
             'Согласие сохранено. Вы можете получать сообщения от владельца Telegram-моста. Для отзыва согласия отправьте /disconnect.',
-            event_id=_vk_send_id(event_id, 'connect'),
+            event_id=_vk_send_id(event_id, 'connect')
         )
         return
     if command == '/disconnect':
@@ -595,14 +600,14 @@ def _handle_vk_message(message, event_id):
         send_vk_message(
             vk_user_id,
             'Согласие отозвано. Новые сообщения через мост пересылаться не будут.',
-            event_id=_vk_send_id(event_id, 'disconnect'),
+            event_id=_vk_send_id(event_id, 'disconnect')
         )
         return
     if command in {'/start', '/help'}:
         send_vk_message(
             vk_user_id,
             'Чтобы разрешить сообщения через мост, отправьте /connect. Для немедленного прекращения и отзыва согласия отправьте /disconnect.',
-            event_id=_vk_send_id(event_id, 'help'),
+            event_id=_vk_send_id(event_id, 'help')
         )
         return
 
@@ -685,7 +690,7 @@ def _handle_vk_message(message, event_id):
         response = requests.post(
             f'https://api.telegram.org/bot{TG_TOKEN}/sendPhoto',
             json={'chat_id': _owner_id(), 'photo': photo_url, 'caption': text[:1024] if text else None},
-            timeout=(5, 15),
+            timeout=(5, 15)
         )
         _raise_for_api_error(response, 'Telegram sendPhoto')
         if len(text) > 1024:
@@ -777,7 +782,7 @@ def healthz():
         configured = False
     status_code = 200 if configured else 503
     return jsonify({
-        'status': 'ok' if configured else 'misconfigured',
+        'status':     'ok' if configured else 'misconfigured',
         'configured': configured,
     }), status_code
 
@@ -794,7 +799,7 @@ def readyz():
         database_ready = False
     status_code = 200 if database_ready else 503
     return jsonify({
-        'status': 'ready' if database_ready else 'not_ready',
+        'status':         'ready' if database_ready else 'not_ready',
         'database_ready': database_ready,
     }), status_code
 
