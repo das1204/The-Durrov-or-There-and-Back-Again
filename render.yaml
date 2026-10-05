@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: The-Durrov-or-There-and-Back-Again
+    name: NAME
     env: python
     plan: free
     region: frankfurt
