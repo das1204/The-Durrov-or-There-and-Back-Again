@@ -14,7 +14,7 @@ from werkzeug.exceptions import (
     BadRequest,
     HTTPException,
     RequestEntityTooLarge,
-    UnsupportedMediaType,
+    UnsupportedMediaType
 )
 import storage
 
@@ -131,9 +131,7 @@ def _request(service_name, method, url, **kwargs):
     try:
         return requests.request(method, url, **kwargs)
     except requests.RequestException:
-        _log_exception(
-            'HTTP request failed: service=%s method=%s', service_name, method.upper()
-        )
+        _log_exception('HTTP request failed: service=%s method=%s', service_name, method.upper())
         raise
 
 
@@ -327,8 +325,7 @@ def _upload_vk_document(peer_id, file_data, filename, content_type):
         raise RuntimeError('VK document upload returned an invalid file')
 
     save_response = _request(
-        'VK docs.save', 'POST',
-        'https://api.vk.com/method/docs.save',
+        'VK docs.save', 'POST', 'https://api.vk.com/method/docs.save',
         data={
             'file':         upload_file,
             'title':        filename[:255],
@@ -349,9 +346,7 @@ def _upload_vk_document(peer_id, file_data, filename, content_type):
     return f'doc{owner_id}_{document_id}{suffix}'
 
 
-def _send_telegram_file(
-    chat_id, method, field_name, file_data, filename, content_type, caption, message_thread_id=None
-):
+def _send_telegram_file(chat_id, method, field_name, file_data, filename, content_type, caption, message_thread_id=None):
     data = {'chat_id': chat_id}
     if message_thread_id is not None:
         data['message_thread_id'] = message_thread_id
