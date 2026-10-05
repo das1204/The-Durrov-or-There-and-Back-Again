@@ -542,8 +542,11 @@ def tg_webhook():
         try:
             storage.finish_event('telegram', event_id, 'failed')
         except Exception:
-            pass
-        logger.error('Telegram webhook processing failed')
+            logger.exception(
+                'Failed to mark Telegram webhook event %s as failed',
+                event_id,
+            )
+        logger.exception('Telegram webhook processing failed (event_id=%s)', event_id)
         return jsonify({'ok': False, 'error': 'telegram_to_vk_failed'}), 500
     return jsonify({'ok': True})
 
