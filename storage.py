@@ -1,6 +1,7 @@
 import os
 import psycopg
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 
 SCHEMA_STATEMENTS = (
@@ -34,6 +35,28 @@ CREATE TABLE IF NOT EXISTS webhook_events (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (provider, event_id)
 );
+""",
+"""
+CREATE TABLE IF NOT EXISTS webhook_queue (
+    queue_id BIGSERIAL PRIMARY KEY,
+    provider TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('queued', 'processing', 'sent', 'failed')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (provider, event_id)
+);
+""",
+"""
+CREATE INDEX IF NOT EXISTS webhook_queue_provider_order
+    ON webhook_queue (provider, queue_id) WHERE state IN ('queued', 'processing');
+""",
+"""
+CREATE INDEX IF NOT EXISTS webhook_queue_terminal_age
+    ON webhook_queue (updated_at) WHERE state IN ('sent', 'failed');
 """,
 """
 CREATE TABLE IF NOT EXISTS outbound_rate_events (
@@ -221,6 +244,127 @@ def claim_event(provider, event_id):
             if existing is None:
                 return True
             return False if existing['state'] == 'sent' else None
+
+
+def enqueue_webhook_event(provider, event_id, payload):
+    message = payload.get('message') if isinstance(payload, dict) else None
+    is_media_group = (
+        provider == 'telegram'
+        and isinstance(message, dict)
+        and isinstance(message.get('media_group_id'), str)
+    )
+    delay_seconds = 1.5 if is_media_group else 0
+    with connect() as connection:
+        connection.execute(
+            """
+            DELETE FROM webhook_queue
+            WHERE state IN ('sent', 'failed') AND updated_at < NOW() - INTERVAL '30 days'
+            """
+        )
+        inserted = connection.execute(
+            """
+            INSERT INTO webhook_queue (provider, event_id, payload, state, available_at)
+            VALUES (%s, %s, %s, 'queued', NOW() + (%s * INTERVAL '1 second'))
+            ON CONFLICT (provider, event_id) DO NOTHING
+            RETURNING queue_id
+            """,
+            (provider, str(event_id), Jsonb(payload), delay_seconds),
+        ).fetchone()
+    return inserted is not None
+
+
+def claim_next_webhook_events(provider):
+    with connect() as connection:
+        with connection.transaction():
+            connection.execute(
+                """
+                UPDATE webhook_queue
+                SET state = 'queued', available_at = NOW(), updated_at = NOW()
+                WHERE provider = %s AND state = 'processing'
+                  AND updated_at < NOW() - INTERVAL '5 minutes'
+                """,
+                (provider,),
+            )
+            first = connection.execute(
+                """
+                SELECT q.queue_id, q.event_id, q.payload
+                FROM webhook_queue AS q
+                WHERE q.provider = %s AND q.state = 'queued' AND q.available_at <= NOW()
+                  AND NOT EXISTS (
+                      SELECT 1 FROM webhook_queue AS earlier
+                      WHERE earlier.provider = q.provider
+                        AND earlier.queue_id < q.queue_id
+                        AND earlier.state IN ('queued', 'processing')
+                  )
+                ORDER BY q.queue_id
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+                """,
+                (provider,),
+            ).fetchone()
+            if first is None:
+                return []
+
+            message = first['payload'].get('message') if isinstance(first['payload'], dict) else None
+            media_group_id = message.get('media_group_id') if isinstance(message, dict) else None
+            if provider == 'telegram' and isinstance(media_group_id, str):
+                queued_rows = connection.execute(
+                    """
+                    SELECT queue_id, event_id, payload
+                    FROM webhook_queue
+                    WHERE provider = %s AND state = 'queued' AND available_at <= NOW()
+                      AND queue_id >= %s
+                    ORDER BY queue_id
+                    FOR UPDATE
+                    """,
+                    (provider, first['queue_id']),
+                ).fetchall()
+                rows = []
+                for row in queued_rows:
+                    row_message = row['payload'].get('message')
+                    if not isinstance(row_message, dict) or row_message.get('media_group_id') != media_group_id:
+                        break
+                    rows.append(row)
+            else:
+                rows = [first]
+
+            queue_ids = [row['queue_id'] for row in rows]
+            claimed = connection.execute(
+                """
+                UPDATE webhook_queue
+                SET state = 'processing', attempts = attempts + 1, updated_at = NOW()
+                WHERE queue_id = ANY(%s)
+                RETURNING queue_id, event_id, payload, attempts
+                """,
+                (queue_ids,),
+            ).fetchall()
+            return sorted(claimed, key=lambda row: row['queue_id'])
+
+
+def finish_webhook_events(queue_ids, succeeded):
+    if not queue_ids:
+        return
+    with connect() as connection:
+        if succeeded:
+            connection.execute(
+                """
+                UPDATE webhook_queue SET state = 'sent', updated_at = NOW()
+                WHERE queue_id = ANY(%s) AND state = 'processing'
+                """,
+                (queue_ids,),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE webhook_queue
+                SET state = CASE WHEN attempts >= 5 THEN 'failed' ELSE 'queued' END,
+                    available_at = NOW() +
+                        (LEAST(60, POWER(2, GREATEST(attempts - 1, 0))) * INTERVAL '1 second'),
+                    updated_at = NOW()
+                WHERE queue_id = ANY(%s) AND state = 'processing'
+                """,
+                (queue_ids,),
+            )
 
 
 def reserve_outbound_message(owner_id):
