@@ -5,6 +5,7 @@ import mimetypes
 import os
 import re
 import random
+import time
 import traceback
 import requests
 from flask import Flask, jsonify, request
@@ -346,6 +347,71 @@ def _upload_vk_document(peer_id, file_data, filename, content_type):
     return f'doc{owner_id}_{document_id}{suffix}'
 
 
+def _upload_vk_message_photo(peer_id, image_data, image_content_type):
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        upload_server_response = _request(
+            'VK photos.getMessagesUploadServer', 'GET', 'https://api.vk.com/method/photos.getMessagesUploadServer',
+            params={
+                'peer_id':      peer_id,
+                'access_token': VK_TOKEN,
+                'v':            '5.199'
+                }, timeout=(5, 15)
+        )
+        upload_server_data = _raise_for_api_error(
+            upload_server_response, 'VK getMessagesUploadServer'
+        )
+        upload_url = safe_dict_get(upload_server_data, 'response', 'upload_url')
+        if not isinstance(upload_url, str) or not upload_url.startswith('https://'):
+            raise RuntimeError('VK upload server returned an invalid URL')
+        upload_response = _request(
+            'VK photo upload', 'POST', upload_url,
+            files={'photo': ('image.jpg', image_data, image_content_type)},
+            timeout=(10, 30)
+        )
+        upload_payload = _raise_for_api_error(upload_response, 'VK upload photo')
+        server = safe_dict_get(upload_payload, 'server')
+        photo = safe_dict_get(upload_payload, 'photo')
+        photo_hash = safe_dict_get(upload_payload, 'hash')
+        if server is None or not isinstance(photo, str) or not photo or not photo_hash:
+            raise RuntimeError('VK photo upload returned an invalid upload receipt')
+
+        save_response = _request(
+            'VK photos.saveMessagesPhoto', 'POST',
+            'https://api.vk.com/method/photos.saveMessagesPhoto',
+            data={
+                'server':       server,
+                'photo':        photo,
+                'hash':         photo_hash,
+                'access_token': VK_TOKEN,
+                'v':            '5.199'
+            }, timeout=(5, 15)
+        )
+        try:
+            save_data = _raise_for_api_error(save_response, 'VK saveMessagesPhoto')
+        except RuntimeError as exc:
+            if 'photos_list is invalid' not in str(exc) or attempt == max_attempts:
+                raise
+            logger.warning(
+                'VK rejected uploaded photo receipt; retrying upload: peer_id=%s attempt=%s/%s',
+                peer_id, attempt + 1, max_attempts
+            )
+            time.sleep(attempt)
+            continue
+
+        save_items = safe_dict_get(save_data, 'response')
+        if not isinstance(save_items, list) or not save_items or not isinstance(save_items[0], dict):
+            raise RuntimeError('VK saveMessagesPhoto returned an invalid response')
+        save_item = save_items[0]
+        owner_id = save_item.get('owner_id')
+        photo_id = save_item.get('id')
+        if not isinstance(owner_id, int) or not isinstance(photo_id, int):
+            raise RuntimeError('VK saveMessagesPhoto returned an invalid photo')
+        return f'photo{owner_id}_{photo_id}'
+
+    raise RuntimeError('VK photo upload retries were exhausted')
+
+
 def _send_telegram_file(chat_id, method, field_name, file_data, filename, content_type, caption, message_thread_id=None):
     data = {'chat_id': chat_id}
     if message_thread_id is not None:
@@ -500,7 +566,7 @@ def _handle_telegram_message(message, event_id):
         reply('Достигнут лимит сообщений: не более 10 в минуту и 1000 в сутки.')
         return
 
-    attachment = ''
+    attachments = []
     photos = message.get('photo')
     if photos is not None:
         if not isinstance(photos, list) or not photos or not isinstance(photos[-1], dict):
@@ -521,40 +587,7 @@ def _handle_telegram_message(message, event_id):
         if not isinstance(image_content_type, str) or not image_content_type.startswith('image/'):
             image_content_type = 'image/jpeg'
 
-        upload_server_response = _request(
-            'VK photos.getMessagesUploadServer', 'GET', 'https://api.vk.com/method/photos.getMessagesUploadServer',
-            params={'peer_id': selected['vk_user_id'], 'access_token': VK_TOKEN, 'v': '5.199'}, timeout=(5, 15)
-        )
-        upload_server_data = _raise_for_api_error(upload_server_response, 'VK getMessagesUploadServer')
-        upload_url = safe_dict_get(upload_server_data, 'response', 'upload_url')
-        if not isinstance(upload_url, str) or not upload_url.startswith('https://'):
-            raise RuntimeError('VK upload server returned an invalid URL')
-        upload_response = _request(
-            'VK photo upload', 'POST', upload_url,
-            files={'photo': ('image', image_data, image_content_type)}, timeout=(10, 30)
-        )
-        upload_payload = _raise_for_api_error(upload_response, 'VK upload photo')
-        save_response = _request(
-            'VK photos.saveMessagesPhoto', 'POST',
-            'https://api.vk.com/method/photos.saveMessagesPhoto',
-            data={
-                'server':       safe_dict_get(upload_payload, 'server'),
-                'photo':        safe_dict_get(upload_payload, 'photo'),
-                'hash':         safe_dict_get(upload_payload, 'hash'),
-                'access_token': VK_TOKEN,
-                'v':            '5.199'
-            }, timeout=(5, 15)
-        )
-        save_data = _raise_for_api_error(save_response, 'VK saveMessagesPhoto')
-        save_items = safe_dict_get(save_data, 'response')
-        if not isinstance(save_items, list) or not save_items or not isinstance(save_items[0], dict):
-            raise RuntimeError('VK saveMessagesPhoto returned an invalid response')
-        save_item = save_items[0]
-        owner_id = save_item.get('owner_id')
-        photo_id = save_item.get('id')
-        if not isinstance(owner_id, int) or not isinstance(photo_id, int):
-            raise RuntimeError('VK saveMessagesPhoto returned an invalid photo')
-        attachment = f'photo{owner_id}_{photo_id}'
+        attachments.append(_upload_vk_message_photo(selected['vk_user_id'], image_data, image_content_type))
 
     media_message = None
     media_kind = None
@@ -598,19 +631,19 @@ def _handle_telegram_message(message, event_id):
         if not isinstance(content_type, str) or '/' not in content_type:
             content_type = downloaded_content_type or mimetypes.guess_type(filename)[0] or 'application/octet-stream'
 
-        attachment = _upload_vk_document(selected['vk_user_id'], file_data, filename, content_type)
+        attachments.append(_upload_vk_document(selected['vk_user_id'], file_data, filename, content_type))
 
-    if not text and not attachment:
+    if not text and not attachments:
         reply('Поддерживаются текст, фотографии, видео, GIF и документы.')
         return
     current_selection = storage.get_forum_contact(message_thread_id)
     if current_selection is None or current_selection['vk_user_id'] != selected['vk_user_id']:
         reply('Согласие или привязка темы изменились. Проверьте подключение VK-собеседника.')
         return
-    send_vk_message(selected['vk_user_id'], text, attachment, event_id=f'tg:{event_id}')
+    send_vk_message(selected['vk_user_id'], text, ','.join(attachments), event_id=f'tg:{event_id}')
     logger.info(
         'Forwarded Telegram message: event_id=%s topic=%s vk_user_id=%s has_attachment=%s',
-        event_id, message_thread_id, selected['vk_user_id'], bool(attachment)
+        event_id, message_thread_id, selected['vk_user_id'], bool(attachments)
     )
 
 
@@ -780,10 +813,10 @@ def _handle_vk_message(message, event_id):
     def notify_owner(notification):
         send_telegram_message(telegram_chat_id, notification, message_thread_id=message_thread_id)
 
-    photo_url = None
-    animation_file = None
-    document_file = None
-    video_link = None
+    photo_urls = []
+    media_files = []
+    video_links = []
+    unsupported_attachment = False
     attachments = message.get('attachments', [])
     if isinstance(attachments, list):
         for item in attachments:
@@ -796,8 +829,10 @@ def _handle_vk_message(message, event_id):
                     continue
                 valid_sizes = [size for size in sizes if isinstance(size, dict) and isinstance(size.get('url'), str)]
                 if valid_sizes:
-                    photo_url = max(valid_sizes, key=lambda size: (size.get('width', 0) or 0) * (size.get('height', 0) or 0))['url']
-                break
+                    photo_urls.append(
+                        max(valid_sizes, key=lambda size: (size.get('width', 0) or 0) * (size.get('height', 0) or 0))['url']
+                    )
+                continue
             if attachment_type == 'video':
                 video = item.get('video')
                 owner_id = video.get('owner_id') if isinstance(video, dict) else None
@@ -809,15 +844,18 @@ def _handle_vk_message(message, event_id):
                         character.isalnum() or character in '_-' for character in access_key
                     ):
                         video_link += f'?access_key={access_key}'
-                    break
-                notify_owner('Не удалось получить ссылку на видео VK.')
-                return
+                    video_links.append(video_link)
+                else:
+                    logger.warning('Skipping VK video with invalid identifiers: event_id=%s', event_id)
+                    unsupported_attachment = True
+                continue
             if attachment_type == 'doc':
                 document = item.get('doc')
                 document_url = document.get('url') if isinstance(document, dict) else None
                 if not _is_vk_document_url(document_url):
-                    notify_owner('Не удалось получить документ из VK.')
-                    return
+                    logger.warning('Skipping VK document with invalid URL: event_id=%s', event_id)
+                    unsupported_attachment = True
+                    continue
                 extension = document.get('ext', '') if isinstance(document, dict) else ''
                 title = document.get('title', '') if isinstance(document, dict) else ''
                 if isinstance(extension, str):
@@ -827,18 +865,20 @@ def _handle_vk_message(message, event_id):
                 filename = _safe_filename(title, f'document.{extension}' if extension else 'document')
                 if extension and not filename.lower().endswith(f'.{extension.lower()}'):
                     filename = f'{filename}.{extension}'
-                file_info = (document_url, filename)
-                if isinstance(extension, str) and extension.lower() == 'gif':
-                    animation_file = file_info
-                else:
-                    document_file = file_info
-                break
-            notify_owner('Получено неподдерживаемое вложение VK; пересылаются текст, фотографии, видео, GIF и документы.')
-            return
+                media_kind = 'animation' if extension.lower() == 'gif' else 'document'
+                media_files.append((media_kind, document_url, filename))
+                continue
+            logger.info(
+                'Skipping unsupported VK attachment type=%s event_id=%s', attachment_type, event_id
+            )
+            unsupported_attachment = True
 
-    if video_link:
-        text = f'{text}\n{video_link}' if text else video_link
-    if not text and not photo_url and not animation_file and not document_file:
+    if video_links:
+        links = '\n'.join(video_links)
+        text = f'{text}\n{links}' if text else links
+    if unsupported_attachment:
+        notify_owner('Часть вложений VK пропущена: поддерживаются фотографии, видео, GIF и документы.')
+    if not text and not photo_urls and not media_files:
         return
     if not storage.reserve_outbound_message(_owner_id()):
         logger.warning(
@@ -851,58 +891,61 @@ def _handle_vk_message(message, event_id):
 
     if len(text) > MAX_MESSAGE_LENGTH:
         text = text[:MAX_MESSAGE_LENGTH]
-    if photo_url:
-        response = _request(
-            'Telegram sendPhoto', 'POST',
-            f'https://api.telegram.org/bot{TG_TOKEN}/sendPhoto',
-            json={
-                'chat_id':           telegram_chat_id,
-                'photo':             photo_url,
-                'caption':           text[:1024] if text else None,
-                'message_thread_id': message_thread_id
-            },
-            timeout=(5, 15)
-        )
-        _raise_for_api_error(response, 'Telegram sendPhoto')
-        if len(text) > 1024:
-            notify_owner(text[1024:])
-    elif animation_file:
-        document_url, filename = animation_file
+    caption_sent = False
+    if photo_urls:
+        for start in range(0, len(photo_urls), 10):
+            photo_batch = photo_urls[start:start + 10]
+            caption = text[:1024] if text and not caption_sent else None
+            if len(photo_batch) == 1:
+                response = _request(
+                    'Telegram sendPhoto', 'POST',
+                    f'https://api.telegram.org/bot{TG_TOKEN}/sendPhoto',
+                    json={
+                        'chat_id':           telegram_chat_id,
+                        'photo':             photo_batch[0],
+                        'caption':           caption,
+                        'message_thread_id': message_thread_id
+                    }, timeout=(5, 15)
+                )
+                _raise_for_api_error(response, 'Telegram sendPhoto')
+            else:
+                media = [{'type': 'photo', 'media': photo_url} for photo_url in photo_batch]
+                if caption:
+                    media[0]['caption'] = caption
+                response = _request(
+                    'Telegram sendMediaGroup', 'POST',
+                    f'https://api.telegram.org/bot{TG_TOKEN}/sendMediaGroup',
+                    json={
+                        'chat_id':           telegram_chat_id,
+                        'media':             media,
+                        'message_thread_id': message_thread_id
+                    }, timeout=(5, 15)
+                )
+                _raise_for_api_error(response, 'Telegram sendMediaGroup')
+            caption_sent = caption_sent or bool(caption)
+
+    for media_kind, document_url, filename in media_files:
         try:
             file_data, content_type = _download_vk_document(document_url, MAX_MEDIA_BYTES)
         except ValueError:
             logger.warning(
-                'Rejected oversized VK GIF: event_id=%s max_bytes=%s', event_id, MAX_MEDIA_BYTES
+                'Rejected oversized VK media: event_id=%s max_bytes=%s filename=%s',
+                event_id, MAX_MEDIA_BYTES, filename
             )
-            notify_owner('GIF из VK превышает лимит 20 МБ.')
-            return
-        content_type = content_type or mimetypes.guess_type(filename)[0] or 'image/gif'
-        _send_telegram_file(
-            telegram_chat_id, 'sendAnimation', 'animation', file_data, filename,
-            content_type, text, message_thread_id
-        )
-        if len(text) > 1024:
-            notify_owner(text[1024:])
-    elif document_file:
-        document_url, filename = document_file
-        try:
-            file_data, content_type = _download_vk_document(document_url, MAX_MEDIA_BYTES)
-        except ValueError:
-            logger.warning(
-                'Rejected oversized VK document: event_id=%s max_bytes=%s',
-                event_id, MAX_MEDIA_BYTES
-            )
-            notify_owner('Документ из VK превышает лимит 20 МБ.')
-            return
+            notify_owner(f'Вложение «{filename}» превышает лимит 20 МБ; оно пропущено.')
+            continue
         content_type = content_type or mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+        caption = text[:1024] if text and not caption_sent else ''
         _send_telegram_file(
-            telegram_chat_id, 'sendDocument', 'document', file_data, filename,
-            content_type, text, message_thread_id
+            telegram_chat_id, 'sendAnimation' if media_kind == 'animation' else 'sendDocument',
+            'animation' if media_kind == 'animation' else 'document',
+            file_data, filename, content_type, caption, message_thread_id
         )
-        if len(text) > 1024:
-            notify_owner(text[1024:])
-    elif text:
+        caption_sent = caption_sent or bool(caption)
+    if text and not caption_sent:
         notify_owner(text)
+    elif len(text) > 1024:
+        notify_owner(text[1024:])
     logger.info('Forwarded VK message event_id=%s to Telegram topic=%s', event_id, message_thread_id)
 
 
