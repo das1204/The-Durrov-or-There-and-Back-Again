@@ -17,6 +17,7 @@ load_dotenv()
 
 TG_TOKEN = os.getenv('TG_TOKEN', '')
 TG_OWNER_ID = os.getenv('TG_OWNER_ID', '')
+TG_FORUM_CHAT_ID = os.getenv('TG_FORUM_CHAT_ID', '')
 TG_WEBHOOK_SECRET = os.getenv('TG_WEBHOOK_SECRET', '')
 VK_TOKEN = os.getenv('VK_TOKEN', '')
 VK_GROUP_ID = os.getenv('VK_GROUP_ID', '')
@@ -52,6 +53,7 @@ def require_bridge_config():
     for name, value in (
         ('TG_TOKEN', TG_TOKEN),
         ('TG_OWNER_ID', TG_OWNER_ID),
+        ('TG_FORUM_CHAT_ID', TG_FORUM_CHAT_ID),
         ('TG_WEBHOOK_SECRET', TG_WEBHOOK_SECRET),
         ('VK_TOKEN', VK_TOKEN),
         ('VK_GROUP_ID', VK_GROUP_ID),
@@ -63,6 +65,8 @@ def require_bridge_config():
             missing.append(name)
     if TG_OWNER_ID and (_owner_id() is None or _owner_id() <= 0):
         missing.append('TG_OWNER_ID must be a positive integer')
+    if TG_FORUM_CHAT_ID and _forum_chat_id() is None:
+        missing.append('TG_FORUM_CHAT_ID must be a negative integer')
     if missing:
         raise RuntimeError(f'Missing required config: {", ".join(missing)}')
 
@@ -252,8 +256,13 @@ def _upload_vk_document(peer_id, file_data, filename, content_type):
     return f'doc{owner_id}_{document_id}{suffix}'
 
 
-def _send_telegram_file(chat_id, method, field_name, file_data, filename, content_type, caption):
+def _send_telegram_file(
+    chat_id, method, field_name, file_data, filename, content_type, caption,
+    message_thread_id=None,
+):
     data = {'chat_id': chat_id}
+    if message_thread_id is not None:
+        data['message_thread_id'] = message_thread_id
     if caption:
         data['caption'] = caption[:1024]
     response = requests.post(
@@ -265,10 +274,12 @@ def _send_telegram_file(chat_id, method, field_name, file_data, filename, conten
     _raise_for_api_error(response, f'Telegram {method}')
 
 
-def send_telegram_message(chat_id, text, reply_markup=None):
+def send_telegram_message(chat_id, text, reply_markup=None, message_thread_id=None):
     payload = {'chat_id': chat_id, 'text': text}
     if reply_markup is not None:
         payload['reply_markup'] = reply_markup
+    if message_thread_id is not None:
+        payload['message_thread_id'] = message_thread_id
     response = requests.post(
         f'https://api.telegram.org/bot{TG_TOKEN}/sendMessage',
         json=payload, timeout=(5, 15)
@@ -298,41 +309,41 @@ def _owner_id():
         return None
 
 
+def _forum_chat_id():
+    if not TG_FORUM_CHAT_ID:
+        return None
+    try:
+        chat_id = int(TG_FORUM_CHAT_ID)
+    except (TypeError, ValueError):
+        return None
+    return chat_id if chat_id < 0 else None
+
+
+def create_telegram_forum_topic(name):
+    response = requests.post(
+        f'https://api.telegram.org/bot{TG_TOKEN}/createForumTopic',
+        json={'chat_id': _forum_chat_id(), 'name': name[:128]}, timeout=(5, 15)
+    )
+    payload = _raise_for_api_error(response, 'Telegram createForumTopic')
+    message_thread_id = safe_dict_get(payload, 'result', 'message_thread_id')
+    if not isinstance(message_thread_id, int) or message_thread_id <= 0:
+        raise RuntimeError('Telegram createForumTopic returned an invalid topic id')
+    return message_thread_id
+
+
 def _handle_telegram_callback(callback):
     callback_id = callback.get('id')
     actor_id = safe_dict_get(callback, 'from', 'id')
     chat_id = safe_dict_get(callback, 'message', 'chat', 'id')
-    if actor_id != _owner_id() or chat_id != _owner_id():
+    if actor_id != _owner_id() or chat_id != _forum_chat_id():
         logger.info(
-            'Ignoring Telegram callback: actor_is_owner=%s, chat_is_owner=%s',
+            'Ignoring Telegram callback: actor_is_owner=%s, chat_is_forum=%s',
             actor_id == _owner_id(),
-            chat_id == _owner_id(),
+            chat_id == _forum_chat_id(),
         )
         return
-    callback_data = callback.get('data', '')
-    if not isinstance(callback_data, str) or not callback_data.startswith('select:'):
-        if callback_id:
-            send_telegram_callback_answer(callback_id, 'Неизвестная команда.', True)
-        return
-    try:
-        vk_user_id = int(callback_data.partition(':')[2])
-    except ValueError:
-        if callback_id:
-            send_telegram_callback_answer(callback_id, 'Этот контакт недоступен.', True)
-        return
-    if not storage.select_contact(_owner_id(), vk_user_id):
-        if callback_id:
-            send_telegram_callback_answer(callback_id, 'Согласие отозвано или контакт недоступен.', True)
-        send_telegram_message(chat_id, 'Этот VK-пользователь больше недоступен. Откройте /list и выберите другого.')
-        return
-    contact = next(
-        (item for item in storage.list_consented_contacts() if item['vk_user_id'] == vk_user_id),
-        None,
-    )
-    name = contact['display_name'] if contact else 'VK-пользователь'
     if callback_id:
-        send_telegram_callback_answer(callback_id, f'Выбран: {name}')
-    send_telegram_message(chat_id, f'Выбран собеседник: {name}. Команда /stop завершит диалог.')
+        send_telegram_callback_answer(callback_id, 'Используйте отдельные темы форума для переписки.')
 
 
 def _handle_telegram_message(message, event_id):
@@ -345,18 +356,25 @@ def _handle_telegram_message(message, event_id):
         )
         return
     owner_id = _owner_id()
-    is_private_chat = chat.get('type') == 'private'
-    chat_is_owner = chat.get('id') == owner_id
+    is_forum_chat = (
+        chat.get('id') == _forum_chat_id()
+        and chat.get('type') == 'supergroup'
+    )
     sender_is_owner = sender.get('id') == owner_id
-    if not is_private_chat or not chat_is_owner or not sender_is_owner:
+    if not is_forum_chat or not sender_is_owner:
         logger.info(
-            'Ignoring Telegram message %s: private_chat=%s, chat_is_owner=%s, sender_is_owner=%s',
+            'Ignoring Telegram message %s: forum_chat=%s, sender_is_owner=%s',
             event_id,
-            is_private_chat,
-            chat_is_owner,
+            is_forum_chat,
             sender_is_owner,
         )
         return
+
+    telegram_chat_id = chat.get('id')
+    message_thread_id = message.get('message_thread_id') if is_forum_chat else None
+
+    def reply(reply_text):
+        send_telegram_message(telegram_chat_id, reply_text, message_thread_id=message_thread_id)
 
     text = message.get('text') or message.get('caption') or ''
     command = _command(message.get('text'))
@@ -369,21 +387,13 @@ def _handle_telegram_message(message, event_id):
         'document' in message,
     )
     if command in {'/start', '/help'}:
-        send_telegram_message(owner_id, 'Используйте /list для выбора VK-собеседника и /stop для завершения диалога.')
+        reply('Пишите ответ в теме нужного VK-собеседника. Новая тема создаётся после его /connect.')
         return
     if command == '/list':
-        contacts = storage.list_consented_contacts()
-        if not contacts:
-            send_telegram_message(owner_id, 'Пока нет согласившихся VK-пользователей. Они должны отправить сообществу /connect.')
-            return
-        keyboard = [
-            [{'text': item['display_name'], 'callback_data': f"select:{item['vk_user_id']}"}] for item in contacts[:90]
-        ]
-        send_telegram_message(owner_id, 'Выберите VK-собеседника:', {'inline_keyboard': keyboard})
+        reply('Для каждого VK-собеседника используется отдельная тема. Пишите в нужной теме.')
         return
     if command == '/stop':
-        storage.clear_selection(owner_id)
-        send_telegram_message(owner_id, 'Диалог завершён. Чтобы выбрать собеседника, используйте /list.')
+        reply('Для завершения переписки просто прекратите писать в эту тему. Чтобы отозвать согласие VK, отправьте /disconnect.')
         return
 
     document = message.get('document')
@@ -397,29 +407,32 @@ def _handle_telegram_message(message, event_id):
         'venue', 'poll', 'dice',
     }
     if unsupported_fields.intersection(message):
-        send_telegram_message(owner_id, 'Поддерживаются текст, фотографии, видео, GIF и документы.')
+        reply('Поддерживаются текст, фотографии, видео, GIF и документы.')
         return
 
-    selected = storage.get_selected_contact(owner_id)
+    if not isinstance(message_thread_id, int):
+        reply('Отправляйте сообщения внутри темы VK-собеседника.')
+        return
+    selected = storage.get_forum_contact(message_thread_id)
     if selected is None:
-        send_telegram_message(owner_id, 'Сначала выберите собеседника командой /list.')
+        reply('Эта тема не связана с активным VK-собеседником. Попросите его отправить /connect.')
         return
     if len(text) > MAX_MESSAGE_LENGTH:
-        send_telegram_message(owner_id, 'Сообщение слишком длинное. Максимум 3500 символов.')
+        reply('Сообщение слишком длинное. Максимум 3500 символов.')
         return
     if not storage.reserve_outbound_message(owner_id):
-        send_telegram_message(owner_id, 'Достигнут лимит сообщений: не более 10 в минуту и 1000 в сутки.')
+        reply('Достигнут лимит сообщений: не более 10 в минуту и 1000 в сутки.')
         return
 
     attachment = ''
     photos = message.get('photo')
     if photos is not None:
         if not isinstance(photos, list) or not photos or not isinstance(photos[-1], dict):
-            send_telegram_message(owner_id, 'Не удалось обработать фотографию.')
+            reply('Не удалось обработать фотографию.')
             return
         file_id = photos[-1].get('file_id')
         if not isinstance(file_id, str) or not file_id:
-            send_telegram_message(owner_id, 'Не удалось обработать фотографию.')
+            reply('Не удалось обработать фотографию.')
             return
         file_response = requests.get(
             f'https://api.telegram.org/bot{TG_TOKEN}/getFile',
@@ -436,10 +449,10 @@ def _handle_telegram_message(message, event_id):
         image_content_type = image_response.headers.get('Content-Type', '').split(';', 1)[0]
         image_data = image_response.content
         if len(image_data) > MAX_PHOTO_BYTES:
-            send_telegram_message(owner_id, 'Фотография превышает лимит 10 МБ.')
+            reply('Фотография превышает лимит 10 МБ.')
             return
         if not image_content_type.startswith('image/'):
-            send_telegram_message(owner_id, 'Поддерживаются только фотографии.')
+            reply('Поддерживаются только фотографии.')
             return
 
         upload_server_response = requests.get(
@@ -497,14 +510,14 @@ def _handle_telegram_message(message, event_id):
     if media_message is not None:
         file_id = media_message.get('file_id')
         if not isinstance(file_id, str) or not file_id:
-            send_telegram_message(owner_id, 'Не удалось обработать файл.')
+            reply('Не удалось обработать файл.')
             return
         try:
             file_data, downloaded_content_type = _download_telegram_file(
                 file_id, MAX_MEDIA_BYTES
             )
         except ValueError:
-            send_telegram_message(owner_id, 'Файл превышает лимит 20 МБ.')
+            reply('Файл превышает лимит 20 МБ.')
             return
         filename = media_message.get('file_name')
         if not isinstance(filename, str) or not filename.strip():
@@ -524,11 +537,11 @@ def _handle_telegram_message(message, event_id):
         )
 
     if not text and not attachment:
-        send_telegram_message(owner_id, 'Поддерживаются текст, фотографии, видео, GIF и документы.')
+        reply('Поддерживаются текст, фотографии, видео, GIF и документы.')
         return
-    current_selection = storage.get_selected_contact(owner_id)
-    if current_selection is None or current_selection['vk_user_id'] != selected['vk_user_id']:
-        send_telegram_message(owner_id, 'Согласие или выбор собеседника изменились. Выберите контакт заново через /list.')
+    current_selection = storage.get_forum_contact(message_thread_id)
+    Invoke-RestMethod "https://api.telegram.org/bot$env:TG_TOKEN/getChat?chat_id=@имя_группы"    if current_selection is None or current_selection['vk_user_id'] != selected['vk_user_id']:
+        reply('Согласие или привязка темы изменились. Проверьте подключение VK-собеседника.')
         return
     send_vk_message(selected['vk_user_id'], text, attachment, event_id=f'tg:{event_id}')
 
@@ -624,10 +637,20 @@ def _handle_vk_message(message, event_id):
     command = _command(text)
 
     if command == '/connect':
-        storage.register_consent(vk_user_id, _vk_display_name(vk_user_id))
+        display_name = _vk_display_name(vk_user_id)
+        storage.register_consent(vk_user_id, display_name)
+        topic = storage.get_forum_topic(vk_user_id)
+        if topic is None:
+            message_thread_id = create_telegram_forum_topic(display_name)
+            storage.save_forum_topic(vk_user_id, message_thread_id)
+            send_telegram_message(
+                _forum_chat_id(),
+                f'Тема для {display_name}. Ответы из этой темы будут отправляться этому VK-пользователю.',
+                message_thread_id=message_thread_id,
+            )
         send_vk_message(
             vk_user_id,
-            'Согласие сохранено. Вы можете получать сообщения от владельца Telegram-моста. Для отзыва согласия отправьте /disconnect.',
+            'Согласие сохранено. Для переписки используйте отдельную тему в Telegram-форуме. Для отзыва согласия отправьте /disconnect.',
             event_id=_vk_send_id(event_id, 'connect')
         )
         return
@@ -642,14 +665,21 @@ def _handle_vk_message(message, event_id):
     if command in {'/start', '/help'}:
         send_vk_message(
             vk_user_id,
-            'Чтобы разрешить сообщения через мост, отправьте /connect. Для немедленного прекращения и отзыва согласия отправьте /disconnect.',
+            'Чтобы разрешить сообщения через мост, отправьте /connect. Для прекращения и отзыва согласия отправьте /disconnect.',
             event_id=_vk_send_id(event_id, 'help')
         )
         return
 
-    selected = storage.get_selected_contact(_owner_id())
-    if selected is None or selected['vk_user_id'] != vk_user_id:
+    selected = storage.get_forum_contact_by_vk_user(vk_user_id)
+    if selected is None:
         return
+    telegram_chat_id = _forum_chat_id()
+    message_thread_id = selected['message_thread_id']
+
+    def notify_owner(notification):
+        send_telegram_message(
+            telegram_chat_id, notification, message_thread_id=message_thread_id
+        )
 
     photo_url = None
     animation_file = None
@@ -681,13 +711,13 @@ def _handle_vk_message(message, event_id):
                     ):
                         video_link += f'?access_key={access_key}'
                     break
-                send_telegram_message(_owner_id(), 'Не удалось получить ссылку на видео VK.')
+                notify_owner('Не удалось получить ссылку на видео VK.')
                 return
             if attachment_type == 'doc':
                 document = item.get('doc')
                 document_url = document.get('url') if isinstance(document, dict) else None
                 if not _is_vk_document_url(document_url):
-                    send_telegram_message(_owner_id(), 'Не удалось получить документ из VK.')
+                    notify_owner('Не удалось получить документ из VK.')
                     return
                 extension = document.get('ext', '') if isinstance(document, dict) else ''
                 title = document.get('title', '') if isinstance(document, dict) else ''
@@ -706,7 +736,7 @@ def _handle_vk_message(message, event_id):
                 else:
                     document_file = file_info
                 break
-            send_telegram_message(_owner_id(), 'Получено неподдерживаемое вложение VK; пересылаются текст, фотографии, видео, GIF и документы.')
+            notify_owner('Получено неподдерживаемое вложение VK; пересылаются текст, фотографии, видео, GIF и документы.')
             return
 
     if video_link:
@@ -716,8 +746,11 @@ def _handle_vk_message(message, event_id):
     if not storage.reserve_outbound_message(_owner_id()):
         logger.warning('Bridge message rate limit reached')
         return
-    current_selection = storage.get_selected_contact(_owner_id())
-    if current_selection is None or current_selection['vk_user_id'] != vk_user_id:
+    current_contact = storage.get_forum_contact_by_vk_user(vk_user_id)
+    if (
+        current_contact is None
+        or current_contact['message_thread_id'] != message_thread_id
+    ):
         return
 
     if len(text) > MAX_MESSAGE_LENGTH:
@@ -725,42 +758,47 @@ def _handle_vk_message(message, event_id):
     if photo_url:
         response = requests.post(
             f'https://api.telegram.org/bot{TG_TOKEN}/sendPhoto',
-            json={'chat_id': _owner_id(), 'photo': photo_url, 'caption': text[:1024] if text else None},
+            json={
+                'chat_id': telegram_chat_id,
+                'photo': photo_url,
+                'caption': text[:1024] if text else None,
+                'message_thread_id': message_thread_id,
+            },
             timeout=(5, 15)
         )
         _raise_for_api_error(response, 'Telegram sendPhoto')
         if len(text) > 1024:
-            send_telegram_message(_owner_id(), text[1024:])
+            notify_owner(text[1024:])
     elif animation_file:
         document_url, filename = animation_file
         try:
             file_data, content_type = _download_vk_document(document_url, MAX_MEDIA_BYTES)
         except ValueError:
-            send_telegram_message(_owner_id(), 'GIF из VK превышает лимит 20 МБ.')
+            notify_owner('GIF из VK превышает лимит 20 МБ.')
             return
         content_type = content_type or mimetypes.guess_type(filename)[0] or 'image/gif'
         _send_telegram_file(
-            _owner_id(), 'sendAnimation', 'animation', file_data, filename,
-            content_type, text,
+            telegram_chat_id, 'sendAnimation', 'animation', file_data, filename,
+            content_type, text, message_thread_id,
         )
         if len(text) > 1024:
-            send_telegram_message(_owner_id(), text[1024:])
+            notify_owner(text[1024:])
     elif document_file:
         document_url, filename = document_file
         try:
             file_data, content_type = _download_vk_document(document_url, MAX_MEDIA_BYTES)
         except ValueError:
-            send_telegram_message(_owner_id(), 'Документ из VK превышает лимит 20 МБ.')
+            notify_owner('Документ из VK превышает лимит 20 МБ.')
             return
         content_type = content_type or mimetypes.guess_type(filename)[0] or 'application/octet-stream'
         _send_telegram_file(
-            _owner_id(), 'sendDocument', 'document', file_data, filename,
-            content_type, text,
+            telegram_chat_id, 'sendDocument', 'document', file_data, filename,
+            content_type, text, message_thread_id,
         )
         if len(text) > 1024:
-            send_telegram_message(_owner_id(), text[1024:])
+            notify_owner(text[1024:])
     elif text:
-        send_telegram_message(_owner_id(), text)
+        notify_owner(text)
 
 
 @app.route('/vk_callback', methods=['POST'])
