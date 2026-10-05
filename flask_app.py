@@ -1,11 +1,13 @@
 import hashlib
 import hmac
 import logging
+import mimetypes
 import os
 import random
 import requests
 from flask import Flask, jsonify, request
 from dotenv import load_dotenv
+from urllib.parse import urljoin, urlparse
 import storage
 
 logging.basicConfig(level=logging.INFO)
@@ -22,6 +24,7 @@ VK_CALLBACK_SECRET = os.getenv('VK_CALLBACK_SECRET', '')
 VK_CONFIRMATION = os.getenv('VK_CONFIRMATION', '')
 MAX_MESSAGE_LENGTH = 3500
 MAX_PHOTO_BYTES = 10 * 1024 * 1024
+MAX_MEDIA_BYTES = 20 * 1024 * 1024
 _database_ready = False
 
 app = Flask(__name__)
@@ -103,6 +106,163 @@ def send_vk_message(vk_user_id, text, attachment='', event_id=None):
     if not isinstance(sent_message_id, int) or sent_message_id <= 0:
         raise RuntimeError('VK messages.send returned an invalid message id')
     return True
+
+
+def _download_telegram_file(file_id, max_bytes):
+    file_response = requests.get(
+        f'https://api.telegram.org/bot{TG_TOKEN}/getFile',
+        params={'file_id': file_id},
+        timeout=(5, 15),
+    )
+    file_data = _raise_for_api_error(file_response, 'Telegram getFile')
+    file_path = safe_dict_get(file_data, 'result', 'file_path')
+    if not isinstance(file_path, str) or not file_path:
+        raise RuntimeError('Telegram getFile returned an invalid file path')
+
+    download_response = requests.get(
+        f'https://api.telegram.org/file/bot{TG_TOKEN}/{file_path}',
+        stream=True,
+        timeout=(10, 30),
+    )
+    try:
+        download_response.raise_for_status()
+        chunks = []
+        total_bytes = 0
+        for chunk in download_response.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            total_bytes += len(chunk)
+            if total_bytes > max_bytes:
+                raise ValueError('Telegram media exceeds its size limit')
+            chunks.append(chunk)
+        content_type = download_response.headers.get('Content-Type', '').split(';', 1)[0]
+        return b''.join(chunks), content_type
+    finally:
+        download_response.close()
+
+
+def _safe_filename(filename, fallback):
+    if not isinstance(filename, str):
+        filename = ''
+    filename = filename.replace('\\', '/').rsplit('/', 1)[-1].strip()
+    filename = ''.join(character for character in filename if character.isprintable())
+    return filename or fallback
+
+
+def _is_vk_document_url(url):
+    if not isinstance(url, str):
+        return False
+    parsed = urlparse(url)
+    try:
+        port = parsed.port
+    except ValueError:
+        return False
+    host = (parsed.hostname or '').lower()
+    return (
+        parsed.scheme == 'https'
+        and port in (None, 443)
+        and (
+            host == 'vk.com'
+            or host.endswith('.vk.com')
+            or host == 'vk.ru'
+            or host.endswith('.vk.ru')
+            or host == 'userapi.com'
+            or host.endswith('.userapi.com')
+        )
+    )
+
+
+def _download_vk_document(url, max_bytes):
+    current_url = url
+    for _ in range(6):
+        if not _is_vk_document_url(current_url):
+            raise RuntimeError('VK document URL is invalid')
+        response = requests.get(
+            current_url,
+            stream=True,
+            allow_redirects=False,
+            timeout=(10, 30),
+        )
+        try:
+            if response.is_redirect:
+                location = response.headers.get('Location')
+                if not isinstance(location, str) or not location:
+                    raise RuntimeError('VK document redirect has no location')
+                current_url = urljoin(current_url, location)
+                continue
+
+            response.raise_for_status()
+            chunks = []
+            total_bytes = 0
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                total_bytes += len(chunk)
+                if total_bytes > max_bytes:
+                    raise ValueError('VK document exceeds its size limit')
+                chunks.append(chunk)
+            content_type = response.headers.get('Content-Type', '').split(';', 1)[0]
+            return b''.join(chunks), content_type
+        finally:
+            response.close()
+    raise RuntimeError('VK document URL redirected too many times')
+
+
+def _upload_vk_document(peer_id, file_data, filename, content_type):
+    server_response = requests.get(
+        'https://api.vk.com/method/docs.getMessagesUploadServer',
+        params={'peer_id': peer_id, 'access_token': VK_TOKEN, 'v': '5.199'},
+        timeout=(5, 15),
+    )
+    server_data = _raise_for_api_error(server_response, 'VK docs.getMessagesUploadServer')
+    upload_url = safe_dict_get(server_data, 'response', 'upload_url')
+    if not isinstance(upload_url, str) or not upload_url.startswith('https://'):
+        raise RuntimeError('VK document upload server returned an invalid URL')
+
+    upload_response = requests.post(
+        upload_url,
+        files={'file': (filename, file_data, content_type)},
+        timeout=(10, 30),
+    )
+    upload_data = _raise_for_api_error(upload_response, 'VK document upload')
+    upload_file = upload_data.get('file') if isinstance(upload_data, dict) else None
+    if not isinstance(upload_file, str) or not upload_file:
+        raise RuntimeError('VK document upload returned an invalid file')
+
+    save_response = requests.post(
+        'https://api.vk.com/method/docs.save',
+        data={
+            'file': upload_file,
+            'title': filename[:255],
+            'access_token': VK_TOKEN,
+            'v': '5.199',
+        },
+        timeout=(5, 15),
+    )
+    save_data = _raise_for_api_error(save_response, 'VK docs.save')
+    saved_doc = safe_dict_get(save_data, 'response', 'doc')
+    if not isinstance(saved_doc, dict):
+        raise RuntimeError('VK docs.save returned an invalid document')
+    owner_id = saved_doc.get('owner_id')
+    document_id = saved_doc.get('id')
+    if not isinstance(owner_id, int) or not isinstance(document_id, int):
+        raise RuntimeError('VK docs.save returned an invalid document')
+    access_key = saved_doc.get('access_key')
+    suffix = f'_{access_key}' if isinstance(access_key, str) and access_key else ''
+    return f'doc{owner_id}_{document_id}{suffix}'
+
+
+def _send_telegram_file(chat_id, method, field_name, file_data, filename, content_type, caption):
+    data = {'chat_id': chat_id}
+    if caption:
+        data['caption'] = caption[:1024]
+    response = requests.post(
+        f'https://api.telegram.org/bot{TG_TOKEN}/{method}',
+        data=data,
+        files={field_name: (filename, file_data, content_type)},
+        timeout=(10, 30),
+    )
+    _raise_for_api_error(response, f'Telegram {method}')
 
 
 def send_telegram_message(chat_id, text, reply_markup=None):
@@ -199,12 +359,18 @@ def _handle_telegram_message(message, event_id):
         send_telegram_message(owner_id, 'Диалог завершён. Чтобы выбрать собеседника, используйте /list.')
         return
 
+    document = message.get('document')
+    document_name = document.get('file_name', '') if isinstance(document, dict) else ''
+    document_mime = document.get('mime_type', '') if isinstance(document, dict) else ''
+    is_gif_document = (
+        isinstance(document_name, str) and document_name.lower().endswith('.gif')
+    ) or document_mime == 'image/gif'
     unsupported_fields = {
-        'document', 'audio', 'video', 'animation', 'voice', 'video_note',
-        'sticker', 'contact', 'location', 'venue', 'poll', 'dice',
+        'audio', 'voice', 'video_note', 'sticker', 'contact', 'location',
+        'venue', 'poll', 'dice',
     }
     if unsupported_fields.intersection(message):
-        send_telegram_message(owner_id, 'Поддерживаются только текст и фотографии.')
+        send_telegram_message(owner_id, 'Поддерживаются текст, фотографии, видео, GIF и документы.')
         return
 
     selected = storage.get_selected_contact(owner_id)
@@ -244,7 +410,7 @@ def _handle_telegram_message(message, event_id):
         if len(image_data) > MAX_PHOTO_BYTES:
             send_telegram_message(owner_id, 'Фотография превышает лимит 10 МБ.')
             return
-        if not image_response.headers.get('Content-Type', '').startswith('image/'):
+        if not image_content_type.startswith('image/'):
             send_telegram_message(owner_id, 'Поддерживаются только фотографии.')
             return
 
@@ -259,7 +425,7 @@ def _handle_telegram_message(message, event_id):
             raise RuntimeError('VK upload server returned an invalid URL')
         upload_response = requests.post(
             upload_url,
-            files={'photo': ('image', image_data, image_response.headers['Content-Type'])},
+            files={'photo': ('image', image_data, image_content_type)},
             timeout=(10, 30),
         )
         upload_payload = _raise_for_api_error(upload_response, 'VK upload photo')
@@ -285,8 +451,52 @@ def _handle_telegram_message(message, event_id):
             raise RuntimeError('VK saveMessagesPhoto returned an invalid photo')
         attachment = f'photo{owner_id}_{photo_id}'
 
+    media_message = None
+    media_kind = None
+    if isinstance(message.get('video'), dict):
+        media_message = message['video']
+        media_kind = 'video'
+    elif isinstance(message.get('animation'), dict):
+        media_message = message['animation']
+        media_kind = 'animation'
+    elif is_gif_document and isinstance(document, dict):
+        media_message = document
+        media_kind = 'gif'
+    elif isinstance(document, dict):
+        media_message = document
+        media_kind = 'document'
+
+    if media_message is not None:
+        file_id = media_message.get('file_id')
+        if not isinstance(file_id, str) or not file_id:
+            send_telegram_message(owner_id, 'Не удалось обработать файл.')
+            return
+        try:
+            file_data, downloaded_content_type = _download_telegram_file(
+                file_id, MAX_MEDIA_BYTES
+            )
+        except ValueError:
+            send_telegram_message(owner_id, 'Файл превышает лимит 20 МБ.')
+            return
+        filename = media_message.get('file_name')
+        if not isinstance(filename, str) or not filename.strip():
+            filename = {
+                'video': 'video.mp4',
+                'animation': 'animation.mp4',
+                'gif': 'animation.gif',
+                'document': 'document',
+            }[media_kind]
+        filename = _safe_filename(filename, 'document')
+        content_type = media_message.get('mime_type')
+        if not isinstance(content_type, str) or '/' not in content_type:
+            content_type = downloaded_content_type or mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+
+        attachment = _upload_vk_document(
+            selected['vk_user_id'], file_data, filename, content_type
+        )
+
     if not text and not attachment:
-        send_telegram_message(owner_id, 'Поддерживаются текст и фотографии.')
+        send_telegram_message(owner_id, 'Поддерживаются текст, фотографии, видео, GIF и документы.')
         return
     current_selection = storage.get_selected_contact(owner_id)
     if current_selection is None or current_selection['vk_user_id'] != selected['vk_user_id']:
@@ -337,8 +547,11 @@ def tg_webhook():
         try:
             storage.finish_event('telegram', event_id, 'failed')
         except Exception:
-            pass
-        logger.error('Telegram webhook processing failed')
+            logger.exception(
+                'Failed to mark Telegram webhook event %s as failed',
+                event_id,
+            )
+        logger.exception('Telegram webhook processing failed (event_id=%s)', event_id)
         return jsonify({'ok': False, 'error': 'telegram_to_vk_failed'}), 500
     return jsonify({'ok': True})
 
@@ -403,15 +616,16 @@ def _handle_vk_message(message, event_id):
         return
 
     photo_url = None
+    animation_file = None
+    document_file = None
+    video_link = None
     attachments = message.get('attachments', [])
     if isinstance(attachments, list):
         for item in attachments:
             if not isinstance(item, dict):
                 continue
-            if item.get('type') != 'photo':
-                send_telegram_message(_owner_id(), 'Получено неподдерживаемое вложение VK; пересылаются только текст и фотографии.')
-                return
-            if item.get('type') == 'photo':
+            attachment_type = item.get('type')
+            if attachment_type == 'photo':
                 sizes = safe_dict_get(item, 'photo', 'sizes')
                 if not isinstance(sizes, list):
                     continue
@@ -419,8 +633,49 @@ def _handle_vk_message(message, event_id):
                 if valid_sizes:
                     photo_url = max(valid_sizes, key=lambda size: (size.get('width', 0) or 0) * (size.get('height', 0) or 0))['url']
                 break
+            if attachment_type == 'video':
+                video = item.get('video')
+                owner_id = video.get('owner_id') if isinstance(video, dict) else None
+                video_id = video.get('id') if isinstance(video, dict) else None
+                if isinstance(owner_id, int) and isinstance(video_id, int):
+                    video_link = f'https://vk.com/video{owner_id}_{video_id}'
+                    access_key = video.get('access_key')
+                    if isinstance(access_key, str) and access_key and all(
+                        character.isalnum() or character in '_-' for character in access_key
+                    ):
+                        video_link += f'?access_key={access_key}'
+                    break
+                send_telegram_message(_owner_id(), 'Не удалось получить ссылку на видео VK.')
+                return
+            if attachment_type == 'doc':
+                document = item.get('doc')
+                document_url = document.get('url') if isinstance(document, dict) else None
+                if not _is_vk_document_url(document_url):
+                    send_telegram_message(_owner_id(), 'Не удалось получить документ из VK.')
+                    return
+                extension = document.get('ext', '') if isinstance(document, dict) else ''
+                title = document.get('title', '') if isinstance(document, dict) else ''
+                if isinstance(extension, str):
+                    extension = ''.join(character for character in extension if character.isalnum())[:16]
+                else:
+                    extension = ''
+                filename = _safe_filename(
+                    title, f'document.{extension}' if extension else 'document'
+                )
+                if extension and not filename.lower().endswith(f'.{extension.lower()}'):
+                    filename = f'{filename}.{extension}'
+                file_info = (document_url, filename)
+                if isinstance(extension, str) and extension.lower() == 'gif':
+                    animation_file = file_info
+                else:
+                    document_file = file_info
+                break
+            send_telegram_message(_owner_id(), 'Получено неподдерживаемое вложение VK; пересылаются текст, фотографии, видео, GIF и документы.')
+            return
 
-    if not text and not photo_url:
+    if video_link:
+        text = f'{text}\n{video_link}' if text else video_link
+    if not text and not photo_url and not animation_file and not document_file:
         return
     if not storage.reserve_outbound_message(_owner_id()):
         logger.warning('Bridge message rate limit reached')
@@ -438,6 +693,34 @@ def _handle_vk_message(message, event_id):
             timeout=(5, 15)
         )
         _raise_for_api_error(response, 'Telegram sendPhoto')
+        if len(text) > 1024:
+            send_telegram_message(_owner_id(), text[1024:])
+    elif animation_file:
+        document_url, filename = animation_file
+        try:
+            file_data, content_type = _download_vk_document(document_url, MAX_MEDIA_BYTES)
+        except ValueError:
+            send_telegram_message(_owner_id(), 'GIF из VK превышает лимит 20 МБ.')
+            return
+        content_type = content_type or mimetypes.guess_type(filename)[0] or 'image/gif'
+        _send_telegram_file(
+            _owner_id(), 'sendAnimation', 'animation', file_data, filename,
+            content_type, text,
+        )
+        if len(text) > 1024:
+            send_telegram_message(_owner_id(), text[1024:])
+    elif document_file:
+        document_url, filename = document_file
+        try:
+            file_data, content_type = _download_vk_document(document_url, MAX_MEDIA_BYTES)
+        except ValueError:
+            send_telegram_message(_owner_id(), 'Документ из VK превышает лимит 20 МБ.')
+            return
+        content_type = content_type or mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+        _send_telegram_file(
+            _owner_id(), 'sendDocument', 'document', file_data, filename,
+            content_type, text,
+        )
         if len(text) > 1024:
             send_telegram_message(_owner_id(), text[1024:])
     elif text:
