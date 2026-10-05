@@ -5,6 +5,7 @@ import mimetypes
 import os
 import re
 import random
+import threading
 import time
 import traceback
 import requests
@@ -36,6 +37,8 @@ MAX_MESSAGE_LENGTH = 3500
 MAX_PHOTO_BYTES = 10 * 1024 * 1024
 MAX_MEDIA_BYTES = 20 * 1024 * 1024
 _database_ready = False
+_queue_workers_pid = None
+_queue_workers_lock = threading.Lock()
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 1024 * 1024
@@ -601,15 +604,16 @@ def _handle_telegram_message(message, event_id):
         source_suffix = f'Источник: {forward_source}'
         text = f'{text}\n\n{source_suffix}' if text else source_suffix
     if not storage.reserve_outbound_message(owner_id):
-        logger.warning(
-            'Outbound rate limit reached: provider=telegram event_id=%s owner_id=%s', event_id, owner_id
-        )
+        logger.warning('Outbound rate limit reached: provider=telegram event_id=%s owner_id=%s', event_id, owner_id)
         reply('Достигнут лимит сообщений: не более 10 в минуту и 1000 в сутки.')
         return
 
     attachments = []
-    photos = message.get('photo')
-    if photos is not None:
+    photo_groups = message.get('media_group_photos')
+    if photo_groups is None:
+        photo = message.get('photo')
+        photo_groups = [photo] if photo is not None else []
+    for photos in photo_groups:
         if not isinstance(photos, list) or not photos or not isinstance(photos[-1], dict):
             reply('Не удалось обработать фотографию.')
             return
@@ -620,14 +624,11 @@ def _handle_telegram_message(message, event_id):
         try:
             image_data, image_content_type = _download_telegram_file(file_id, MAX_PHOTO_BYTES)
         except ValueError:
-            logger.warning(
-                'Rejected oversized Telegram photo: event_id=%s max_bytes=%s', event_id, MAX_PHOTO_BYTES
-            )
+            logger.warning('Rejected oversized Telegram photo: event_id=%s max_bytes=%s', event_id, MAX_PHOTO_BYTES)
             reply('Фотография превышает лимит 10 МБ.')
             return
         if not isinstance(image_content_type, str) or not image_content_type.startswith('image/'):
             image_content_type = 'image/jpeg'
-
         attachments.append(_upload_vk_message_photo(selected['vk_user_id'], image_data, image_content_type))
 
     media_message = None
@@ -703,6 +704,79 @@ def _handle_telegram_update(update, event_id):
     )
 
 
+def _handle_telegram_album(messages, event_ids):
+    if len(messages) < 2 or not all(isinstance(message.get('photo'), list) for message in messages):
+        for message, event_id in zip(messages, event_ids):
+            _handle_telegram_message(message, event_id)
+        return
+
+    combined = dict(messages[0])
+    combined['media_group_photos'] = [message['photo'] for message in messages]
+    captions = []
+    for message in messages:
+        caption = message.get('text') or message.get('caption')
+        if isinstance(caption, str) and caption.strip() and caption not in captions:
+            captions.append(caption.strip())
+        for key in ('forward_origin', 'forward_from_chat', 'forward_from_message_id', 'sender_chat'):
+            if not combined.get(key) and message.get(key):
+                combined[key] = message[key]
+    combined['text'] = '\n'.join(captions)
+    combined.pop('caption', None)
+    _handle_telegram_message(combined, event_ids[0])
+
+
+def _queue_worker(provider):
+    while True:
+        try:
+            events = storage.claim_next_webhook_events(provider)
+        except Exception:
+            _log_exception('Failed to claim webhook queue item: provider=%s', provider)
+            time.sleep(2)
+            continue
+        if not events:
+            time.sleep(0.5)
+            continue
+
+        queue_ids = [event['queue_id'] for event in events]
+        event_ids = ','.join(event['event_id'] for event in events)
+        try:
+            if provider == 'telegram':
+                messages = [
+                    safe_dict_get(event['payload'], 'message')
+                    for event in events
+                ]
+                if len(events) > 1 and all(isinstance(message, dict) for message in messages):
+                    _handle_telegram_album(messages, [event['event_id'] for event in events])
+                else:
+                    _handle_telegram_update(events[0]['payload'], events[0]['event_id'])
+            else:
+                _handle_vk_message(events[0]['payload'], events[0]['event_id'])
+            storage.finish_webhook_events(queue_ids, succeeded=True)
+            logger.info('Finished queued webhook events: provider=%s event_ids=%s', provider, event_ids)
+        except Exception:
+            _log_exception('Queued webhook processing failed: provider=%s event_ids=%s', provider, event_ids)
+            try:
+                storage.finish_webhook_events(queue_ids, succeeded=False)
+            except Exception:
+                _log_exception(
+                    'Failed to update queued webhook events: provider=%s event_ids=%s',
+                    provider, event_ids
+                )
+
+
+def _start_queue_workers():
+    global _queue_workers_pid
+    process_id = os.getpid()
+    with _queue_workers_lock:
+        if _queue_workers_pid == process_id:
+            return
+        for provider in ('telegram', 'vk'):
+            threading.Thread(
+                target=_queue_worker, args=(provider,), name=f'{provider}-webhook-queue', daemon=True
+            ).start()
+        _queue_workers_pid = process_id
+
+
 def _verify_telegram_webhook():
     provided = request.headers.get('X-Telegram-Bot-Api-Secret-Token', '')
     return bool(TG_WEBHOOK_SECRET) and hmac.compare_digest(provided, TG_WEBHOOK_SECRET)
@@ -724,14 +798,10 @@ def tg_webhook():
     except RequestEntityTooLarge as exc:
         return request_too_large(exc)
     except BadRequest:
-        logger.warning(
-            'Rejected Telegram webhook request: malformed JSON, content_type=%s', request.mimetype
-        )
+        logger.warning('Rejected Telegram webhook request: malformed JSON, content_type=%s', request.mimetype)
         return jsonify({'ok': False, 'error': 'invalid_payload'}), 400
     except UnsupportedMediaType:
-        logger.warning(
-            'Rejected Telegram webhook request: unsupported content_type=%s', request.mimetype
-        )
+        logger.warning('Rejected Telegram webhook request: unsupported content_type=%s', request.mimetype)
         return jsonify({'ok': False, 'error': 'invalid_content_type'}), 415
     if not isinstance(update, dict) or not isinstance(update.get('update_id'), int):
         logger.warning('Rejected Telegram webhook request: invalid update payload')
@@ -741,30 +811,18 @@ def tg_webhook():
         'Received Telegram webhook update %s: keys=%s', event_id,
         ','.join(sorted(key for key in update if isinstance(key, str)))
     )
-    event_claimed = False
     try:
         ensure_database()
-        event_claim = storage.claim_event('telegram', event_id)
-        if event_claim is False:
-            logger.info('Ignoring duplicate Telegram webhook event_id=%s', event_id)
-            return jsonify({'ok': True})
-        if event_claim is None:
-            logger.warning('Telegram webhook event_id=%s is already processing', event_id)
-            return jsonify({'ok': False, 'error': 'event_in_progress'}), 503
-        event_claimed = True
-        logger.info('Processing Telegram webhook event_id=%s', event_id)
-        _handle_telegram_update(update, event_id)
-        storage.finish_event('telegram', event_id, 'sent')
-        logger.info('Finished Telegram webhook event_id=%s', event_id)
+        _start_queue_workers()
+        queued = storage.enqueue_webhook_event('telegram', event_id, update)
     except Exception:
-        if event_claimed:
-            try:
-                storage.finish_event('telegram', event_id, 'failed')
-            except Exception:
-                _log_exception('Failed to mark Telegram webhook event %s as failed', event_id)
-        _log_exception('Telegram webhook processing failed (event_id=%s)', event_id)
-        return jsonify({'ok': False, 'error': 'telegram_to_vk_failed'}), 500
-    return jsonify({'ok': True})
+        _log_exception('Failed to enqueue Telegram webhook event_id=%s', event_id)
+        return jsonify({'ok': False, 'error': 'telegram_queue_unavailable'}), 503
+    if not queued:
+        logger.info('Ignoring duplicate Telegram webhook event_id=%s', event_id)
+        return jsonify({'ok': True})
+    logger.info('Queued Telegram webhook event_id=%s', event_id)
+    return jsonify({'ok': True, 'queued': True})
 
 
 def _vk_display_name(vk_user_id):
@@ -1107,29 +1165,17 @@ def vk_callback():
         logger.warning('Rejected VK message_new callback: invalid message payload, event_id=%s', event_id)
         return jsonify({'ok': False, 'error': 'invalid_payload'}), 400
 
-    event_claimed = False
     try:
         ensure_database()
-        event_claim = storage.claim_event('vk', event_id)
-        if event_claim is False:
-            logger.info('Ignoring duplicate VK webhook event_id=%s', event_id)
-            return 'ok'
-        if event_claim is None:
-            logger.warning('VK webhook event_id=%s is already processing', event_id)
-            return 'retry', 503
-        event_claimed = True
-        logger.info('Processing VK webhook event_id=%s', event_id)
-        _handle_vk_message(message, event_id)
-        storage.finish_event('vk', event_id, 'sent')
-        logger.info('Finished VK webhook event_id=%s', event_id)
+        _start_queue_workers()
+        queued = storage.enqueue_webhook_event('vk', event_id, message)
     except Exception:
-        if event_claimed:
-            try:
-                storage.finish_event('vk', event_id, 'failed')
-            except Exception:
-                _log_exception('Failed to mark VK webhook event %s as failed', event_id)
-        _log_exception('VK webhook processing failed (event_id=%s)', event_id)
-        return jsonify({'ok': False, 'error': 'vk_to_telegram_failed'}), 500
+        _log_exception('Failed to enqueue VK webhook event_id=%s', event_id)
+        return jsonify({'ok': False, 'error': 'vk_queue_unavailable'}), 503
+    if not queued:
+        logger.info('Ignoring duplicate VK webhook event_id=%s', event_id)
+        return 'ok'
+    logger.info('Queued VK webhook event_id=%s', event_id)
     return 'ok'
 
 
