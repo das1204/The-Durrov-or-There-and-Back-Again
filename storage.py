@@ -20,6 +20,13 @@ CREATE TABLE IF NOT EXISTS telegram_selection (
 );
 """,
 """
+CREATE TABLE IF NOT EXISTS telegram_forum_topics (
+    vk_user_id BIGINT PRIMARY KEY REFERENCES vk_contacts(vk_user_id),
+    message_thread_id BIGINT NOT NULL UNIQUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+""",
+"""
 CREATE TABLE IF NOT EXISTS webhook_events (
     provider TEXT NOT NULL,
     event_id TEXT NOT NULL,
@@ -118,6 +125,57 @@ def get_selected_contact(owner_id):
             WHERE s.owner_id = %s AND c.revoked_at IS NULL
             """,
             (owner_id,),
+        ).fetchone()
+
+
+def get_forum_topic(vk_user_id):
+    with connect() as connection:
+        return connection.execute(
+            """
+            SELECT message_thread_id
+            FROM telegram_forum_topics
+            WHERE vk_user_id = %s
+            """,
+            (vk_user_id,),
+        ).fetchone()
+
+
+def save_forum_topic(vk_user_id, message_thread_id):
+    with connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO telegram_forum_topics (vk_user_id, message_thread_id)
+            VALUES (%s, %s)
+            ON CONFLICT (vk_user_id) DO UPDATE
+            SET message_thread_id = EXCLUDED.message_thread_id
+            """,
+            (vk_user_id, message_thread_id),
+        )
+
+
+def get_forum_contact(message_thread_id):
+    with connect() as connection:
+        return connection.execute(
+            """
+            SELECT c.vk_user_id, c.display_name
+            FROM telegram_forum_topics AS t
+            JOIN vk_contacts AS c ON c.vk_user_id = t.vk_user_id
+            WHERE t.message_thread_id = %s AND c.revoked_at IS NULL
+            """,
+            (message_thread_id,),
+        ).fetchone()
+
+
+def get_forum_contact_by_vk_user(vk_user_id):
+    with connect() as connection:
+        return connection.execute(
+            """
+            SELECT c.vk_user_id, c.display_name, t.message_thread_id
+            FROM telegram_forum_topics AS t
+            JOIN vk_contacts AS c ON c.vk_user_id = t.vk_user_id
+            WHERE t.vk_user_id = %s AND c.revoked_at IS NULL
+            """,
+            (vk_user_id,),
         ).fetchone()
 
 

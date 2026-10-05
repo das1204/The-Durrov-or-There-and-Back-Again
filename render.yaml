@@ -16,6 +16,8 @@ services:
         sync: false
       - key: TG_WEBHOOK_SECRET
         sync: false
+      - key: TG_FORUM_CHAT_ID
+        sync: false
       - key: VK_TOKEN
         sync: false
       - key: VK_GROUP_ID
