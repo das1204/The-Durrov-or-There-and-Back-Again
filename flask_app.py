@@ -4,6 +4,7 @@ import logging
 import mimetypes
 import os
 import random
+import traceback
 import requests
 from flask import Flask, jsonify, request
 from dotenv import load_dotenv
@@ -46,6 +47,22 @@ def _raise_for_api_error(response, service_name):
         raise RuntimeError(f'{service_name} API returned ok=false')
 
     return payload
+
+
+def _log_exception(message, *args):
+    formatted_traceback = traceback.format_exc()
+    secrets = (
+        TG_TOKEN,
+        VK_TOKEN,
+        TG_WEBHOOK_SECRET,
+        VK_CALLBACK_SECRET,
+        os.getenv('DATABASE_URL', '')
+    )
+    for secret in secrets:
+        if secret:
+            formatted_traceback = formatted_traceback.replace(secret, '[REDACTED]')
+    log_message = message % args if args else message
+    logger.error('%s\n%s', log_message, formatted_traceback.rstrip())
 
 
 def require_bridge_config():
@@ -216,7 +233,7 @@ def _upload_vk_document(peer_id, file_data, filename, content_type):
     server_response = requests.get(
         'https://api.vk.com/method/docs.getMessagesUploadServer',
         params={'peer_id': peer_id, 'access_token': VK_TOKEN, 'v': '5.199'},
-        timeout=(5, 15),
+        timeout=(5, 15)
     )
     server_data = _raise_for_api_error(server_response, 'VK docs.getMessagesUploadServer')
     upload_url = safe_dict_get(server_data, 'response', 'upload_url')
@@ -236,12 +253,12 @@ def _upload_vk_document(peer_id, file_data, filename, content_type):
     save_response = requests.post(
         'https://api.vk.com/method/docs.save',
         data={
-            'file': upload_file,
-            'title': filename[:255],
+            'file':         upload_file,
+            'title':        filename[:255],
             'access_token': VK_TOKEN,
-            'v': '5.199',
+            'v':            '5.199'
         },
-        timeout=(5, 15),
+        timeout=(5, 15)
     )
     save_data = _raise_for_api_error(save_response, 'VK docs.save')
     saved_doc = safe_dict_get(save_data, 'response', 'doc')
@@ -257,8 +274,7 @@ def _upload_vk_document(peer_id, file_data, filename, content_type):
 
 
 def _send_telegram_file(
-    chat_id, method, field_name, file_data, filename, content_type, caption,
-    message_thread_id=None,
+    chat_id, method, field_name, file_data, filename, content_type, caption, message_thread_id=None
 ):
     data = {'chat_id': chat_id}
     if message_thread_id is not None:
@@ -266,10 +282,8 @@ def _send_telegram_file(
     if caption:
         data['caption'] = caption[:1024]
     response = requests.post(
-        f'https://api.telegram.org/bot{TG_TOKEN}/{method}',
-        data=data,
-        files={field_name: (filename, file_data, content_type)},
-        timeout=(10, 30),
+        f'https://api.telegram.org/bot{TG_TOKEN}/{method}', data=data,
+        files={field_name: (filename, file_data, content_type)}, timeout=(10, 30)
     )
     _raise_for_api_error(response, f'Telegram {method}')
 
@@ -339,7 +353,7 @@ def _handle_telegram_callback(callback):
         logger.info(
             'Ignoring Telegram callback: actor_is_owner=%s, chat_is_forum=%s',
             actor_id == _owner_id(),
-            chat_id == _forum_chat_id(),
+            chat_id == _forum_chat_id()
         )
         return
     if callback_id:
@@ -350,10 +364,7 @@ def _handle_telegram_message(message, event_id):
     chat = message.get('chat')
     sender = message.get('from')
     if not isinstance(chat, dict) or not isinstance(sender, dict):
-        logger.warning(
-            'Ignoring Telegram update %s without a valid message chat or sender',
-            event_id,
-        )
+        logger.warning('Ignoring Telegram update %s without a valid message chat or sender', event_id)
         return
     owner_id = _owner_id()
     is_forum_chat = (
@@ -364,9 +375,7 @@ def _handle_telegram_message(message, event_id):
     if not is_forum_chat or not sender_is_owner:
         logger.info(
             'Ignoring Telegram message %s: forum_chat=%s, sender_is_owner=%s',
-            event_id,
-            is_forum_chat,
-            sender_is_owner,
+            event_id, is_forum_chat, sender_is_owner
         )
         return
 
@@ -384,7 +393,7 @@ def _handle_telegram_message(message, event_id):
         command or 'none',
         bool(text),
         'photo' in message,
-        'document' in message,
+        'document' in message
     )
     if command in {'/start', '/help'}:
         reply('Пишите ответ в теме нужного VK-собеседника. Новая тема создаётся после его /connect.')
@@ -404,7 +413,7 @@ def _handle_telegram_message(message, event_id):
     ) or document_mime == 'image/gif'
     unsupported_fields = {
         'audio', 'voice', 'video_note', 'sticker', 'contact', 'location',
-        'venue', 'poll', 'dice',
+        'venue', 'poll', 'dice'
     }
     if unsupported_fields.intersection(message):
         reply('Поддерживаются текст, фотографии, видео, GIF и документы.')
@@ -434,23 +443,14 @@ def _handle_telegram_message(message, event_id):
         if not isinstance(file_id, str) or not file_id:
             reply('Не удалось обработать фотографию.')
             return
-        file_response = requests.get(
-            f'https://api.telegram.org/bot{TG_TOKEN}/getFile',
-            params={'file_id': file_id}, timeout=(5, 15)
-        )
-        file_data = _raise_for_api_error(file_response, 'Telegram getFile')
-        file_path = safe_dict_get(file_data, 'result', 'file_path')
-        if not isinstance(file_path, str) or not file_path:
-            raise RuntimeError('Telegram getFile returned an invalid file path')
-        image_response = requests.get(
-            f'https://api.telegram.org/file/bot{TG_TOKEN}/{file_path}', timeout=(10, 30)
-        )
-        image_response.raise_for_status()
-        image_content_type = image_response.headers.get('Content-Type', '').split(';', 1)[0]
-        image_data = image_response.content
-        if len(image_data) > MAX_PHOTO_BYTES:
+        try:
+            image_data, image_content_type = _download_telegram_file(
+                file_id, MAX_PHOTO_BYTES
+            )
+        except ValueError:
             reply('Фотография превышает лимит 10 МБ.')
             return
+        image_content_type = image_content_type or ''
         if not image_content_type.startswith('image/'):
             reply('Поддерживаются только фотографии.')
             return
@@ -599,8 +599,12 @@ def tg_webhook():
         try:
             storage.finish_event('telegram', event_id, 'failed')
         except Exception:
-            logger.exception('Failed to mark Telegram webhook event %s as failed', event_id)
-        logger.exception('Telegram webhook processing failed (event_id=%s)', event_id)
+            _log_exception(
+                'Failed to mark Telegram webhook event %s as failed', event_id
+            )
+        _log_exception(
+            'Telegram webhook processing failed (event_id=%s)', event_id
+        )
         return jsonify({'ok': False, 'error': 'telegram_to_vk_failed'}), 500
     return jsonify({'ok': True})
 
@@ -619,7 +623,7 @@ def _vk_display_name(vk_user_id):
             if name:
                 return name[:80]
     except Exception:
-        pass
+        _log_exception('Failed to resolve display name for VK user %s', vk_user_id)
     return 'Пользователь VK'
 
 
@@ -635,6 +639,12 @@ def _handle_vk_message(message, event_id):
     if not isinstance(text, str):
         text = ''
     command = _command(text)
+    logger.info(
+        'Processing VK message event_id=%s, vk_user_id=%s, command=%s',
+        event_id,
+        vk_user_id,
+        command or 'none',
+    )
 
     if command == '/connect':
         display_name = _vk_display_name(vk_user_id)
@@ -672,6 +682,11 @@ def _handle_vk_message(message, event_id):
 
     selected = storage.get_forum_contact_by_vk_user(vk_user_id)
     if selected is None:
+        logger.debug(
+            'Ignoring VK message event_id=%s from unconnected user_id=%s',
+            event_id,
+            vk_user_id,
+        )
         return
     telegram_chat_id = _forum_chat_id()
     message_thread_id = selected['message_thread_id']
@@ -799,6 +814,11 @@ def _handle_vk_message(message, event_id):
             notify_owner(text[1024:])
     elif text:
         notify_owner(text)
+    logger.info(
+        'Forwarded VK message event_id=%s to Telegram topic=%s',
+        event_id,
+        message_thread_id,
+    )
 
 
 @app.route('/vk_callback', methods=['POST'])
@@ -832,17 +852,24 @@ def vk_callback():
         ensure_database()
         event_claim = storage.claim_event('vk', event_id)
         if event_claim is False:
+            logger.info('Ignoring duplicate VK webhook event_id=%s', event_id)
             return 'ok'
         if event_claim is None:
+            logger.warning('VK webhook event_id=%s is already processing', event_id)
             return 'retry', 503
+        logger.info('Processing VK webhook event_id=%s', event_id)
         _handle_vk_message(message, event_id)
         storage.finish_event('vk', event_id, 'sent')
     except Exception:
         try:
             storage.finish_event('vk', event_id, 'failed')
         except Exception:
-            pass
-        logger.error('VK webhook processing failed')
+            _log_exception(
+                'Failed to mark VK webhook event %s as failed', event_id
+            )
+        _log_exception(
+            'VK webhook processing failed (event_id=%s)', event_id
+        )
         return jsonify({'ok': False, 'error': 'vk_to_telegram_failed'}), 500
     return 'ok'
 
@@ -852,7 +879,11 @@ def healthz():
     try:
         require_bridge_config()
         configured = True
+    except RuntimeError as exc:
+        logger.warning('Health check found invalid configuration: %s', exc)
+        configured = False
     except Exception:
+        _log_exception('Health check failed unexpectedly')
         configured = False
     status_code = 200 if configured else 503
     return jsonify({
@@ -870,6 +901,7 @@ def readyz():
             connection.execute('SELECT 1')
         database_ready = True
     except Exception:
+        _log_exception('Readiness check failed')
         database_ready = False
     status_code = 200 if database_ready else 503
     return jsonify({
