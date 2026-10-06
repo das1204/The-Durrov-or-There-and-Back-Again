@@ -257,8 +257,8 @@ def _safe_filename(filename, fallback):
 def _is_vk_document_url(url):
     if not isinstance(url, str):
         return False
-    parsed = urlparse(url)
     try:
+        parsed = urlparse(url)
         port = parsed.port
     except ValueError:
         return False
@@ -273,6 +273,10 @@ def _is_vk_document_url(url):
             or host.endswith('.vk.ru')
             or host == 'userapi.com'
             or host.endswith('.userapi.com')
+            or host == 'vkuser.net'
+            or host.endswith('.vkuser.net')
+            or host == 'vkusercdn.ru'
+            or host.endswith('.vkusercdn.ru')
         )
     )
 
@@ -282,8 +286,8 @@ def _is_vk_photo_url(url):
         return True
     if not isinstance(url, str):
         return False
-    parsed = urlparse(url)
     try:
+        parsed = urlparse(url)
         port = parsed.port
     except ValueError:
         return False
@@ -1102,7 +1106,14 @@ def _handle_vk_message(message, event_id):
                 document = item.get('doc')
                 document_url = document.get('url') if isinstance(document, dict) else None
                 if not _is_vk_document_url(document_url):
-                    logger.warning('Skipping VK document with invalid URL: event_id=%s', event_id)
+                    try:
+                        document_host = urlparse(document_url).hostname
+                    except (TypeError, ValueError):
+                        document_host = None
+                    logger.warning(
+                        'Skipping VK document with invalid URL: event_id=%s host=%s',
+                        event_id, document_host or 'missing'
+                    )
                     unsupported_attachment = True
                     continue
                 extension = document.get('ext', '') if isinstance(document, dict) else ''
@@ -1219,6 +1230,13 @@ def _handle_vk_message(message, event_id):
                 event_id, MAX_MEDIA_BYTES, filename
             )
             notify_owner(f'Вложение «{filename}» превышает лимит 20 МБ; оно пропущено.')
+            continue
+        except RuntimeError:
+            _log_exception(
+                'Failed to download VK attachment: event_id=%s filename=%s',
+                event_id, filename
+            )
+            notify_owner(f'Не удалось скачать вложение «{filename}» из VK; оно пропущено.')
             continue
         content_type = content_type or mimetypes.guess_type(filename)[0] or 'application/octet-stream'
         caption = text[:1024] if text and not caption_sent else ''
