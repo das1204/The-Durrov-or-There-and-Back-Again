@@ -63,9 +63,7 @@ def handle_unexpected_error(error):
             request.method, request.path, error.code, error.name
         )
         return error
-    _log_exception(
-        'Unhandled Flask error: path=%s method=%s', request.path, request.method
-    )
+    _log_exception('Unhandled Flask error: path=%s method=%s', request.path, request.method)
     return jsonify({'ok': False, 'error': 'internal_server_error'}), 500
 
 
@@ -277,6 +275,8 @@ def _is_vk_document_url(url):
             or host.endswith('.vkuser.net')
             or host == 'vkusercdn.ru'
             or host.endswith('.vkusercdn.ru')
+            or host == 'vkuserphoto.ru'
+            or host.endswith('.vkuserphoto.ru')
         )
     )
 
