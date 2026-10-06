@@ -34,6 +34,7 @@ VK_TOKEN = os.getenv('VK_TOKEN', '')
 VK_GROUP_ID = os.getenv('VK_GROUP_ID', '')
 VK_CALLBACK_SECRET = os.getenv('VK_CALLBACK_SECRET', '')
 VK_CONFIRMATION = os.getenv('VK_CONFIRMATION', '')
+DATABASE_URL = os.getenv('DATABASE_URL', '')
 MAX_MESSAGE_LENGTH = 3500
 MAX_PHOTO_BYTES = 10 * 1024 * 1024
 MAX_MEDIA_BYTES = 20 * 1024 * 1024
@@ -69,7 +70,7 @@ def handle_unexpected_error(error):
 
 
 def _redact_secrets(value):
-    for secret in (TG_TOKEN, VK_TOKEN, TG_WEBHOOK_SECRET, VK_CALLBACK_SECRET, os.getenv('DATABASE_URL', '')):
+    for secret in (TG_TOKEN, VK_TOKEN, TG_WEBHOOK_SECRET, VK_CALLBACK_SECRET, DATABASE_URL):
         if secret:
             value = value.replace(secret, '[REDACTED]')
     return re.sub(r'(https?://[^\s?#]+)\?[^\s#]*', r'\1?[REDACTED]', value)
@@ -151,7 +152,7 @@ def require_bridge_config():
         ('VK_GROUP_ID',        VK_GROUP_ID),
         ('VK_CALLBACK_SECRET', VK_CALLBACK_SECRET),
         ('VK_CONFIRMATION',    VK_CONFIRMATION),
-        ('DATABASE_URL',       os.getenv('DATABASE_URL', ''))
+        ('DATABASE_URL',       DATABASE_URL)
     ):
         if not value:
             missing.append(name)
@@ -276,14 +277,36 @@ def _is_vk_document_url(url):
     )
 
 
-def _download_vk_file(url, max_bytes):
+def _is_vk_photo_url(url):
+    if _is_vk_document_url(url):
+        return True
+    if not isinstance(url, str):
+        return False
+    parsed = urlparse(url)
+    try:
+        port = parsed.port
+    except ValueError:
+        return False
+    host = (parsed.hostname or '').lower()
+    return (
+        parsed.scheme == 'https'
+        and port in (None, 443)
+        and (host == 'vkuserphoto.ru' or host.endswith('.vkuserphoto.ru'))
+    )
+
+
+def _download_vk_file(url, max_bytes, allow_photo_cdn=False):
     current_url = url
     for _ in range(6):
-        if not _is_vk_document_url(current_url):
-            raise RuntimeError('VK media URL is invalid')
+        is_allowed_url = (
+            _is_vk_photo_url(current_url)
+            if allow_photo_cdn else _is_vk_document_url(current_url)
+        )
+        if not is_allowed_url:
+            host = urlparse(current_url).hostname or 'unknown'
+            raise RuntimeError(f'VK media URL is invalid: host={host}')
         response = _request(
-            'VK media download', 'GET', current_url,
-            stream=True, allow_redirects=False, timeout=(10, 30)
+            'VK media download', 'GET', current_url, stream=True, allow_redirects=False, timeout=(10, 30)
         )
         try:
             if response.is_redirect:
@@ -366,16 +389,13 @@ def _upload_vk_message_photo(peer_id, image_data, image_content_type):
                 'v':            '5.199'
                 }, timeout=(5, 15)
         )
-        upload_server_data = _raise_for_api_error(
-            upload_server_response, 'VK getMessagesUploadServer'
-        )
+        upload_server_data = _raise_for_api_error(upload_server_response, 'VK getMessagesUploadServer')
         upload_url = safe_dict_get(upload_server_data, 'response', 'upload_url')
         if not isinstance(upload_url, str) or not upload_url.startswith('https://'):
             raise RuntimeError('VK upload server returned an invalid URL')
         upload_response = _request(
             'VK photo upload', 'POST', upload_url,
-            files={'photo': ('image.jpg', image_data, image_content_type)},
-            timeout=(10, 30)
+            files={'photo': ('image.jpg', image_data, image_content_type)}, timeout=(10, 30)
         )
         upload_payload = _raise_for_api_error(upload_response, 'VK upload photo')
         server = safe_dict_get(upload_payload, 'server')
@@ -449,7 +469,11 @@ def send_telegram_message(chat_id, text, reply_markup=None, message_thread_id=No
 def send_telegram_callback_answer(callback_id, text='', show_alert=False):
     response = _request(
         'Telegram answerCallbackQuery', 'POST', f'https://api.telegram.org/bot{TG_TOKEN}/answerCallbackQuery',
-        json={'callback_query_id': callback_id, 'text': text, 'show_alert': show_alert}, timeout=(5, 15)
+        json={
+            'callback_query_id': callback_id,
+            'text':              text,
+            'show_alert':        show_alert
+            }, timeout=(5, 15)
     )
     _raise_for_api_error(response, 'Telegram answerCallbackQuery')
 
@@ -773,10 +797,7 @@ def _queue_worker(provider):
         event_ids = ','.join(event['event_id'] for event in events)
         try:
             if provider == 'telegram':
-                messages = [
-                    safe_dict_get(event['payload'], 'message')
-                    for event in events
-                ]
+                messages = [safe_dict_get(event['payload'], 'message') for event in events]
                 if len(events) > 1 and all(isinstance(message, dict) for message in messages):
                     _handle_telegram_album(messages, [event['event_id'] for event in events])
                 else:
@@ -791,8 +812,7 @@ def _queue_worker(provider):
                 storage.finish_webhook_events(queue_ids, succeeded=False)
             except Exception:
                 _log_exception(
-                    'Failed to update queued webhook events: provider=%s event_ids=%s',
-                    provider, event_ids
+                    'Failed to update queued webhook events: provider=%s event_ids=%s', provider, event_ids
                 )
 
 
@@ -977,9 +997,7 @@ def _handle_vk_message(message, event_id):
 
     selected = storage.get_forum_contact_by_vk_user(vk_user_id)
     if selected is None:
-        logger.debug(
-            'Ignoring VK message event_id=%s from unconnected user_id=%s', event_id, vk_user_id
-        )
+        logger.debug('Ignoring VK message event_id=%s from unconnected user_id=%s', event_id, vk_user_id)
         return
     telegram_chat_id = _forum_chat_id()
     message_thread_id = selected['message_thread_id']
@@ -1048,8 +1066,7 @@ def _handle_vk_message(message, event_id):
                 if isinstance(copy_history, list):
                     attachments_to_process.extend(
                         {'type': 'wall', 'wall': copied_post}
-                        for copied_post in copy_history
-                        if isinstance(copied_post, dict)
+                        for copied_post in copy_history if isinstance(copied_post, dict)
                     )
                 continue
             if attachment_type == 'photo':
@@ -1145,7 +1162,9 @@ def _handle_vk_message(message, event_id):
             downloaded_photos = []
             for photo_url in photo_batch:
                 try:
-                    image_data, content_type = _download_vk_file(photo_url, MAX_PHOTO_BYTES)
+                    image_data, content_type = _download_vk_file(
+                        photo_url, MAX_PHOTO_BYTES, allow_photo_cdn=True
+                    )
                 except ValueError:
                     logger.warning(
                         'Rejected oversized VK photo: event_id=%s max_bytes=%s',
