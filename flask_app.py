@@ -23,6 +23,7 @@ import storage
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 load_dotenv()
 
@@ -391,6 +392,10 @@ def _upload_vk_message_video(file_data, filename, content_type):
     if group_id == 0:
         raise RuntimeError('VK_GROUP_ID must be a non-zero integer to upload videos')
 
+    logger.info(
+        'Starting VK video upload: filename=%s size_bytes=%s group_id=%s',
+        filename, len(file_data), group_id
+    )
     server_response = _request(
         'VK video.save', 'POST', 'https://api.vk.com/method/video.save',
         data={
@@ -418,6 +423,10 @@ def _upload_vk_message_video(file_data, filename, content_type):
 
     access_key = safe_dict_get(server_data, 'response', 'access_key')
     suffix = f'_{access_key}' if isinstance(access_key, str) and access_key else ''
+    logger.info(
+        'VK video upload completed: owner_id=%s video_id=%s size_bytes=%s',
+        owner_id, video_id, len(file_data)
+    )
     return f'video{owner_id}_{video_id}{suffix}'
 
 
@@ -692,6 +701,13 @@ def _handle_telegram_message(message, event_id):
     is_gif_document = (
         isinstance(document_name, str) and document_name.lower().endswith('.gif')
     ) or document_mime == 'image/gif'
+    video_extensions = {'.3gp', '.avi', '.flv', '.m4v', '.mov', '.mp4', '.mpeg', '.mpg', '.wmv'}
+    is_video_document = (
+        isinstance(document_mime, str) and document_mime.startswith('video/')
+    ) or (
+        isinstance(document_name, str)
+        and os.path.splitext(document_name)[1].lower() in video_extensions
+    )
     unsupported_fields = {'audio', 'voice', 'sticker', 'contact', 'location', 'venue', 'poll', 'dice'}
     if unsupported_fields.intersection(message):
         reply('Поддерживаются текст, фотографии, видео, GIF и документы.')
@@ -752,6 +768,9 @@ def _handle_telegram_message(message, event_id):
     elif is_gif_document and isinstance(document, dict):
         media_message = document
         media_kind = 'gif'
+    elif is_video_document and isinstance(document, dict):
+        media_message = document
+        media_kind = 'video'
     elif isinstance(document, dict):
         media_message = document
         media_kind = 'document'
@@ -1017,7 +1036,7 @@ def _vk_video_message_url(attachment):
     if not isinstance(video, dict):
         return None
 
-    for key in ('link_mp4', 'video_url', 'link'):
+    for key in ('link_mp4', 'video_url', 'url', 'link'):
         url = video.get(key)
         if isinstance(url, str) and url:
             return url
@@ -1037,6 +1056,48 @@ def _vk_video_message_url(attachment):
         )
         if mp4_files:
             return mp4_files[0][1]
+    return None
+
+
+def _fetch_vk_video_message_url(attachment, event_id):
+    video = attachment.get('video_message')
+    if not isinstance(video, dict):
+        video = attachment.get('video')
+    if not isinstance(video, dict):
+        return None
+
+    owner_id = video.get('owner_id')
+    video_id = video.get('id')
+    if not isinstance(owner_id, int) or not isinstance(video_id, int):
+        return None
+
+    access_key = video.get('access_key')
+    video_identifier = f'{owner_id}_{video_id}'
+    if isinstance(access_key, str) and access_key:
+        video_identifier = f'{video_identifier}_{access_key}'
+    response = _request(
+        'VK video.get', 'GET', 'https://api.vk.com/method/video.get',
+        params={'videos': video_identifier, 'access_token': VK_TOKEN, 'v': '5.199'},
+        timeout=(5, 15)
+    )
+    data = _raise_for_api_error(response, 'VK video.get')
+    videos = safe_dict_get(data, 'response')
+    if isinstance(videos, dict):
+        videos = videos.get('items')
+    if not isinstance(videos, list) or not videos or not isinstance(videos[0], dict):
+        logger.warning(
+            'VK video.get returned no video message files: event_id=%s owner_id=%s video_id=%s',
+            event_id, owner_id, video_id
+        )
+        return None
+
+    url = _vk_video_message_url({'video': videos[0]})
+    if url:
+        return url
+    logger.warning(
+        'VK video.get returned no MP4 URL: event_id=%s owner_id=%s video_id=%s',
+        event_id, owner_id, video_id
+    )
     return None
 
 
@@ -1179,6 +1240,15 @@ def _handle_vk_message(message, event_id):
             if attachment_type in {'video', 'video_message'}:
                 if _is_vk_video_message(item):
                     video_url = _vk_video_message_url(item)
+                    if not video_url:
+                        try:
+                            video_url = _fetch_vk_video_message_url(item, event_id)
+                        except RuntimeError:
+                            _log_exception(
+                                'Failed to resolve VK video message URL: event_id=%s',
+                                event_id
+                            )
+                            video_url = None
                     if not _is_vk_document_url(video_url):
                         try:
                             video_host = urlparse(video_url).hostname
@@ -1233,6 +1303,7 @@ def _handle_vk_message(message, event_id):
                     continue
                 extension = document.get('ext', '') if isinstance(document, dict) else ''
                 title = document.get('title', '') if isinstance(document, dict) else ''
+                document_mime = document.get('mime_type', '') if isinstance(document, dict) else ''
                 if isinstance(extension, str):
                     extension = ''.join(character for character in extension if character.isalnum())[:16]
                 else:
@@ -1240,7 +1311,14 @@ def _handle_vk_message(message, event_id):
                 filename = _safe_filename(title, f'document.{extension}' if extension else 'document')
                 if extension and not filename.lower().endswith(f'.{extension.lower()}'):
                     filename = f'{filename}.{extension}'
-                media_kind = 'animation' if extension.lower() == 'gif' else 'document'
+                if extension.lower() == 'gif':
+                    media_kind = 'animation'
+                elif (
+                    isinstance(document_mime, str) and document_mime.startswith('video/')
+                ) or extension.lower() in {'3gp', 'avi', 'flv', 'm4v', 'mov', 'mp4', 'mpeg', 'mpg', 'wmv'}:
+                    media_kind = 'video'
+                else:
+                    media_kind = 'document'
                 media_files.append((media_kind, document_url, filename))
                 continue
             logger.info('Skipping unsupported VK attachment type=%s event_id=%s', attachment_type, event_id)
