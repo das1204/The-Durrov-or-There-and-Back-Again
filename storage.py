@@ -3,6 +3,8 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+TELEGRAM_MEDIA_GROUP_DEBOUNCE_SECONDS = 3
+
 
 SCHEMA_STATEMENTS = (
 """
@@ -253,7 +255,7 @@ def enqueue_webhook_event(provider, event_id, payload):
         and isinstance(message, dict)
         and isinstance(message.get('media_group_id'), str)
     )
-    delay_seconds = 1.5 if is_media_group else 0
+    delay_seconds = TELEGRAM_MEDIA_GROUP_DEBOUNCE_SECONDS if is_media_group else 0
     with connect() as connection:
         connection.execute(
             """
@@ -270,6 +272,16 @@ def enqueue_webhook_event(provider, event_id, payload):
             """,
             (provider, str(event_id), Jsonb(payload), delay_seconds),
         ).fetchone()
+        if inserted is not None and is_media_group:
+            connection.execute(
+                """
+                UPDATE webhook_queue
+                SET available_at = NOW() + (%s * INTERVAL '1 second')
+                WHERE provider = %s AND state = 'queued'
+                  AND payload->'message'->>'media_group_id' = %s
+                """,
+                (delay_seconds, provider, message['media_group_id']),
+            )
     return inserted is not None
 
 
