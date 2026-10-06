@@ -462,14 +462,42 @@ def _command(text):
 
 def _telegram_forward_source(message):
     origin = message.get('forward_origin')
+    source_user = None
     source_chat = None
     source_message_id = None
     if isinstance(origin, dict):
-        if origin.get('type') == 'channel':
+        if origin.get('type') == 'user':
+            source_user = origin.get('sender_user')
+        elif origin.get('type') == 'channel':
             source_chat = origin.get('chat')
             source_message_id = origin.get('message_id')
         elif origin.get('type') == 'chat':
             source_chat = origin.get('sender_chat')
+        elif origin.get('type') == 'hidden_user':
+            hidden_name = origin.get('sender_user_name')
+            if isinstance(hidden_name, str) and hidden_name.strip():
+                return f'Сообщение от {hidden_name.strip()}'
+    if not isinstance(source_user, dict):
+        source_user = message.get('forward_from')
+    if isinstance(source_user, dict):
+        first_name = source_user.get('first_name')
+        last_name = source_user.get('last_name')
+        title = ' '.join(
+            part.strip() for part in (first_name, last_name)
+            if isinstance(part, str) and part.strip()
+        )
+        username = source_user.get('username')
+        user_id = source_user.get('id')
+        if not title:
+            title = f'@{username}' if isinstance(username, str) and username else ''
+        if isinstance(username, str) and re.fullmatch(r'[A-Za-z0-9_]{5,32}', username):
+            source_url = f'https://t.me/{username}'
+        elif isinstance(user_id, int) and user_id > 0:
+            source_url = f'tg://user?id={user_id}'
+        else:
+            source_url = ''
+        if title and source_url:
+            return f'Сообщение от {title} ({source_url})'
     if not isinstance(source_chat, dict):
         source_chat = message.get('forward_from_chat')
         source_message_id = message.get('forward_from_message_id')
@@ -494,7 +522,7 @@ def _telegram_forward_source(message):
         if not chat_id_text.startswith('-100') or not isinstance(source_message_id, int):
             return None
         source_url = f'https://t.me/c/{chat_id_text[4:]}/{source_message_id}'
-    return f'{title.strip()} ({source_url})'
+    return f'Источник: {title.strip()} ({source_url})'
 
 
 def _owner_id():
@@ -606,8 +634,7 @@ def _handle_telegram_message(message, event_id):
         return
     forward_source = _telegram_forward_source(message)
     if forward_source:
-        source_suffix = f'Источник: {forward_source}'
-        text = f'{text}\n\n{source_suffix}' if text else source_suffix
+        text = f'{text}\n\n{forward_source}' if text else forward_source
     if not storage.reserve_outbound_message(owner_id):
         logger.warning('Outbound rate limit reached: provider=telegram event_id=%s owner_id=%s', event_id, owner_id)
         reply('Достигнут лимит сообщений: не более 10 в минуту и 1000 в сутки.')
@@ -872,6 +899,25 @@ def _vk_group_source(group_id):
     return name, source_url
 
 
+def _vk_forward_sources(message):
+    forwarded_messages = message.get('fwd_messages')
+    if not isinstance(forwarded_messages, list):
+        return []
+
+    sources = []
+    seen_user_ids = set()
+    for forwarded_message in forwarded_messages:
+        if not isinstance(forwarded_message, dict):
+            continue
+        user_id = forwarded_message.get('from_id')
+        if not isinstance(user_id, int) or user_id <= 0 or user_id in seen_user_ids:
+            continue
+        seen_user_ids.add(user_id)
+        display_name = _vk_display_name(user_id)
+        sources.append(f'Сообщение от {display_name} (https://vk.com/id{user_id})')
+    return sources
+
+
 def _vk_send_id(event_id, suffix='reply'):
     return f'vk:{event_id}:{suffix}'
 
@@ -946,6 +992,7 @@ def _handle_vk_message(message, event_id):
     media_files = []
     video_links = []
     wall_sources = {}
+    forward_sources = _vk_forward_sources(message)
     unsupported_attachment = False
     attachments = message.get('attachments', [])
     wall_texts = []
@@ -1038,6 +1085,9 @@ def _handle_vk_message(message, event_id):
     if wall_texts:
         wall_text = '\n\n'.join(wall_texts)
         text = f'{text}\n\n{wall_text}' if text else wall_text
+    if forward_sources:
+        forwarded_attribution = '\n'.join(forward_sources)
+        text = f'{text}\n\n{forwarded_attribution}' if text else forwarded_attribution
     if video_links:
         links = '\n'.join(video_links)
         text = f'{text}\n{links}' if text else links
@@ -1101,8 +1151,7 @@ def _handle_vk_message(message, event_id):
                 _raise_for_api_error(response, 'Telegram sendPhoto')
             else:
                 media = [
-                    {'type': 'photo', 'media': f'attach://photo{index}'}
-                    for index in range(len(downloaded_photos))
+                    {'type': 'photo', 'media': f'attach://photo{index}'} for index in range(len(downloaded_photos))
                 ]
                 if caption:
                     media[0]['caption'] = caption
@@ -1110,15 +1159,14 @@ def _handle_vk_message(message, event_id):
                     'Telegram sendMediaGroup', 'POST',
                     f'https://api.telegram.org/bot{TG_TOKEN}/sendMediaGroup',
                     data={
-                        'chat_id': telegram_chat_id,
-                        'media': json.dumps(media),
+                        'chat_id':           telegram_chat_id,
+                        'media':             json.dumps(media),
                         'message_thread_id': message_thread_id
                     },
                     files={
                         f'photo{index}': (f'photo{index}.jpg', image_data, content_type)
                         for index, (image_data, content_type) in enumerate(downloaded_photos)
-                    },
-                    timeout=(10, 30)
+                    }, timeout=(10, 30)
                 )
                 _raise_for_api_error(response, 'Telegram sendMediaGroup')
             caption_sent = caption_sent or bool(caption)
