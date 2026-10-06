@@ -803,7 +803,20 @@ def _handle_telegram_message(message, event_id):
             content_type = downloaded_content_type or mimetypes.guess_type(filename)[0] or 'application/octet-stream'
 
         if media_kind == 'video':
-            attachments.append(_upload_vk_message_video(file_data, filename, content_type))
+            try:
+                attachment = _upload_vk_message_video(file_data, filename, content_type)
+            except RuntimeError as exc:
+                if not str(exc).startswith('VK video.save API error 5:'):
+                    raise
+                logger.warning(
+                    'VK video.save is not authorized; sending video as a downloadable document: '
+                    'event_id=%s filename=%s',
+                    event_id, filename
+                )
+                attachment = _upload_vk_document(
+                    selected['vk_user_id'], file_data, filename, content_type
+                )
+            attachments.append(attachment)
         else:
             attachments.append(_upload_vk_document(selected['vk_user_id'], file_data, filename, content_type))
 
@@ -1016,6 +1029,8 @@ def _vk_forwarded_messages(message):
 def _is_vk_video_message(attachment):
     if attachment.get('type') == 'video_message':
         return True
+    if isinstance(attachment.get('video_message'), dict):
+        return True
     if attachment.get('is_video_message') is True or attachment.get('is_video_message') == 1:
         return True
     video = attachment.get('video')
@@ -1030,9 +1045,13 @@ def _is_vk_video_message(attachment):
 
 def _vk_video_message_url(attachment):
     if attachment.get('type') == 'video_message':
-        video = attachment.get('video_message')
+        video = attachment.get('video_message') or attachment.get('video')
     else:
-        video = attachment.get('video')
+        video = attachment.get('video_message') or attachment.get('video')
+    if not isinstance(video, dict) and any(
+        key in attachment for key in ('link_mp4', 'video_url', 'url', 'link', 'files')
+    ):
+        video = attachment
     if not isinstance(video, dict):
         return None
 
@@ -1063,6 +1082,10 @@ def _fetch_vk_video_message_url(attachment, event_id):
     video = attachment.get('video_message')
     if not isinstance(video, dict):
         video = attachment.get('video')
+    if not isinstance(video, dict) and any(
+        key in attachment for key in ('owner_id', 'id', 'access_key')
+    ):
+        video = attachment
     if not isinstance(video, dict):
         return None
 
@@ -1255,8 +1278,18 @@ def _handle_vk_message(message, event_id):
                         except (TypeError, ValueError):
                             video_host = None
                         logger.warning(
-                            'Skipping VK video message with invalid URL: event_id=%s host=%s',
-                            event_id, video_host or 'missing'
+                            'Skipping VK video message with invalid URL: event_id=%s host=%s '
+                            'attachment_type=%s attachment_keys=%s video_keys=%s',
+                            event_id, video_host or 'missing', attachment_type,
+                            ','.join(sorted(item.keys())),
+                            ','.join(sorted(
+                                key for key in (
+                                    item.get('video_message')
+                                    if isinstance(item.get('video_message'), dict)
+                                    else item.get('video') if isinstance(item.get('video'), dict)
+                                    else {}
+                                )
+                            ))
                         )
                         unsupported_attachment = True
                         continue
@@ -1321,7 +1354,8 @@ def _handle_vk_message(message, event_id):
                     media_kind = 'document'
                 media_files.append((media_kind, document_url, filename))
                 continue
-            logger.info('Skipping unsupported VK attachment type=%s event_id=%s', attachment_type, event_id)
+            logger.info(            'Skipping unsupported VK attachment type=%s event_id=%s attachment_keys=%s',
+            attachment_type, event_id, ','.join(sorted(item.keys())))
             unsupported_attachment = True
 
     if wall_texts:
