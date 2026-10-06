@@ -21,7 +21,7 @@ from werkzeug.exceptions import (
 )
 import storage
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
 load_dotenv()
@@ -945,6 +945,52 @@ def _vk_forwarded_messages(message):
     return collected
 
 
+def _is_vk_video_message(attachment):
+    if attachment.get('type') == 'video_message':
+        return True
+    if attachment.get('is_video_message') is True or attachment.get('is_video_message') == 1:
+        return True
+    video = attachment.get('video')
+    if not isinstance(video, dict):
+        return False
+    return (
+        video.get('is_video_message') is True
+        or video.get('is_video_message') == 1
+        or video.get('type') == 'video_message'
+    )
+
+
+def _vk_video_message_url(attachment):
+    if attachment.get('type') == 'video_message':
+        video = attachment.get('video_message')
+    else:
+        video = attachment.get('video')
+    if not isinstance(video, dict):
+        return None
+
+    for key in ('link_mp4', 'video_url', 'link'):
+        url = video.get(key)
+        if isinstance(url, str) and url:
+            return url
+
+    files = video.get('files')
+    if isinstance(files, dict):
+        mp4_files = sorted(
+            (
+                (int(match.group(1)), url)
+                for key, url in files.items()
+                if isinstance(key, str)
+                and (match := re.fullmatch(r'mp4_(\d+)', key))
+                and isinstance(url, str)
+                and url
+            ),
+            reverse=True
+        )
+        if mp4_files:
+            return mp4_files[0][1]
+    return None
+
+
 def _vk_send_id(event_id, suffix='reply'):
     return f'vk:{event_id}:{suffix}'
 
@@ -1090,7 +1136,33 @@ def _handle_vk_message(message, event_id):
                 else:
                     unsupported_attachment = True
                 continue
-            if attachment_type == 'video':
+            if attachment_type in {'video', 'video_message'}:
+                if _is_vk_video_message(item):
+                    video_url = _vk_video_message_url(item)
+                    if not _is_vk_document_url(video_url):
+                        try:
+                            video_host = urlparse(video_url).hostname
+                        except (TypeError, ValueError):
+                            video_host = None
+                        logger.warning(
+                            'Skipping VK video message with invalid URL: event_id=%s host=%s',
+                            event_id, video_host or 'missing'
+                        )
+                        unsupported_attachment = True
+                        continue
+                    media_files.append(('video', video_url, 'video_message.mp4'))
+                    logger.info(
+                        'Queued VK video message for Telegram upload: event_id=%s host=%s',
+                        event_id, urlparse(video_url).hostname
+                    )
+                    continue
+                if attachment_type == 'video_message':
+                    logger.warning(
+                        'Skipping VK video message without a downloadable video: event_id=%s',
+                        event_id
+                    )
+                    unsupported_attachment = True
+                    continue
                 video = item.get('video')
                 owner_id = video.get('owner_id') if isinstance(video, dict) else None
                 video_id = video.get('id') if isinstance(video, dict) else None
@@ -1105,25 +1177,6 @@ def _handle_vk_message(message, event_id):
                 else:
                     logger.warning('Skipping VK video with invalid identifiers: event_id=%s', event_id)
                     unsupported_attachment = True
-                continue
-            if attachment_type == 'video_message':
-                video_message = item.get('video_message')
-                video_url = (
-                    video_message.get('link_mp4') or video_message.get('link')
-                    if isinstance(video_message, dict) else None
-                )
-                if not _is_vk_document_url(video_url):
-                    try:
-                        video_host = urlparse(video_url).hostname
-                    except (TypeError, ValueError):
-                        video_host = None
-                    logger.warning(
-                        'Skipping VK video message with invalid URL: event_id=%s host=%s',
-                        event_id, video_host or 'missing'
-                    )
-                    unsupported_attachment = True
-                    continue
-                media_files.append(('video', video_url, 'video_message.mp4'))
                 continue
             if attachment_type == 'doc':
                 document = item.get('doc')
@@ -1272,6 +1325,10 @@ def _handle_vk_message(message, event_id):
         _send_telegram_file(
             telegram_chat_id, telegram_method, field_name,
             file_data, filename, content_type, caption, message_thread_id
+        )
+        logger.info(
+            'Sent VK attachment to Telegram: event_id=%s media_kind=%s method=%s filename=%s topic=%s',
+            event_id, media_kind, telegram_method, filename, message_thread_id
         )
         caption_sent = caption_sent or bool(caption)
     if text and not caption_sent:
