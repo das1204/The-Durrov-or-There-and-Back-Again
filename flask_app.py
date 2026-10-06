@@ -626,8 +626,9 @@ def _handle_telegram_message(message, event_id):
     text = message.get('text') or message.get('caption') or ''
     command = _command(message.get('text'))
     logger.info(
-        'Processing Telegram message %s: command=%s, has_text=%s, has_photo=%s, has_document=%s',
-        event_id, command or 'none', bool(text), 'photo' in message, 'document' in message
+        'Processing Telegram message %s: command=%s, has_text=%s, has_photo=%s, has_video=%s, has_document=%s',
+        event_id, command or 'none', bool(text), 'photo' in message,
+        'video' in message or 'video_note' in message, 'document' in message
     )
     if command in {'/start', '/help'}:
         reply('Пишите ответ в теме нужного VK-собеседника. Новая тема создаётся после его /connect.')
@@ -645,7 +646,7 @@ def _handle_telegram_message(message, event_id):
     is_gif_document = (
         isinstance(document_name, str) and document_name.lower().endswith('.gif')
     ) or document_mime == 'image/gif'
-    unsupported_fields = {'audio', 'voice', 'video_note', 'sticker', 'contact', 'location', 'venue', 'poll', 'dice'}
+    unsupported_fields = {'audio', 'voice', 'sticker', 'contact', 'location', 'venue', 'poll', 'dice'}
     if unsupported_fields.intersection(message):
         reply('Поддерживаются текст, фотографии, видео, GIF и документы.')
         return
@@ -693,7 +694,10 @@ def _handle_telegram_message(message, event_id):
 
     media_message = None
     media_kind = None
-    if isinstance(message.get('video'), dict):
+    if isinstance(message.get('video_note'), dict):
+        media_message = message['video_note']
+        media_kind = 'video'
+    elif isinstance(message.get('video'), dict):
         media_message = message['video']
         media_kind = 'video'
     elif isinstance(message.get('animation'), dict):
@@ -1102,6 +1106,25 @@ def _handle_vk_message(message, event_id):
                     logger.warning('Skipping VK video with invalid identifiers: event_id=%s', event_id)
                     unsupported_attachment = True
                 continue
+            if attachment_type == 'video_message':
+                video_message = item.get('video_message')
+                video_url = (
+                    video_message.get('link_mp4') or video_message.get('link')
+                    if isinstance(video_message, dict) else None
+                )
+                if not _is_vk_document_url(video_url):
+                    try:
+                        video_host = urlparse(video_url).hostname
+                    except (TypeError, ValueError):
+                        video_host = None
+                    logger.warning(
+                        'Skipping VK video message with invalid URL: event_id=%s host=%s',
+                        event_id, video_host or 'missing'
+                    )
+                    unsupported_attachment = True
+                    continue
+                media_files.append(('video', video_url, 'video_message.mp4'))
+                continue
             if attachment_type == 'doc':
                 document = item.get('doc')
                 document_url = document.get('url') if isinstance(document, dict) else None
@@ -1240,9 +1263,14 @@ def _handle_vk_message(message, event_id):
             continue
         content_type = content_type or mimetypes.guess_type(filename)[0] or 'application/octet-stream'
         caption = text[:1024] if text and not caption_sent else ''
+        if media_kind == 'video':
+            telegram_method, field_name = 'sendVideo', 'video'
+        elif media_kind == 'animation':
+            telegram_method, field_name = 'sendAnimation', 'animation'
+        else:
+            telegram_method, field_name = 'sendDocument', 'document'
         _send_telegram_file(
-            telegram_chat_id, 'sendAnimation' if media_kind == 'animation' else 'sendDocument',
-            'animation' if media_kind == 'animation' else 'document',
+            telegram_chat_id, telegram_method, field_name,
             file_data, filename, content_type, caption, message_thread_id
         )
         caption_sent = caption_sent or bool(caption)
