@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 import logging
 import mimetypes
 import os
@@ -275,20 +276,20 @@ def _is_vk_document_url(url):
     )
 
 
-def _download_vk_document(url, max_bytes):
+def _download_vk_file(url, max_bytes):
     current_url = url
     for _ in range(6):
         if not _is_vk_document_url(current_url):
-            raise RuntimeError('VK document URL is invalid')
+            raise RuntimeError('VK media URL is invalid')
         response = _request(
-            'VK document download', 'GET', current_url,
+            'VK media download', 'GET', current_url,
             stream=True, allow_redirects=False, timeout=(10, 30)
         )
         try:
             if response.is_redirect:
                 location = response.headers.get('Location')
                 if not isinstance(location, str) or not location:
-                    raise RuntimeError('VK document redirect has no location')
+                    raise RuntimeError('VK media redirect has no location')
                 current_url = urljoin(current_url, location)
                 continue
 
@@ -300,13 +301,17 @@ def _download_vk_document(url, max_bytes):
                     continue
                 total_bytes += len(chunk)
                 if total_bytes > max_bytes:
-                    raise ValueError('VK document exceeds its size limit')
+                    raise ValueError('VK media exceeds its size limit')
                 chunks.append(chunk)
             content_type = response.headers.get('Content-Type', '').split(';', 1)[0]
             return b''.join(chunks), content_type
         finally:
             response.close()
-    raise RuntimeError('VK document URL redirected too many times')
+    raise RuntimeError('VK media URL redirected too many times')
+
+
+def _download_vk_document(url, max_bytes):
+    return _download_vk_file(url, max_bytes)
 
 
 def _upload_vk_document(peer_id, file_data, filename, content_type):
@@ -980,12 +985,15 @@ def _handle_vk_message(message, event_id):
             if attachment_type == 'photo':
                 sizes = safe_dict_get(item, 'photo', 'sizes')
                 if not isinstance(sizes, list):
+                    unsupported_attachment = True
                     continue
                 valid_sizes = [size for size in sizes if isinstance(size, dict) and isinstance(size.get('url'), str)]
                 if valid_sizes:
                     photo_urls.append(
                         max(valid_sizes, key=lambda size: (size.get('width', 0) or 0) * (size.get('height', 0) or 0))['url']
                     )
+                else:
+                    unsupported_attachment = True
                 continue
             if attachment_type == 'video':
                 video = item.get('video')
@@ -1064,30 +1072,53 @@ def _handle_vk_message(message, event_id):
         for start in range(0, len(photo_urls), 10):
             photo_batch = photo_urls[start:start + 10]
             caption = text[:1024] if text and not caption_sent else None
-            if len(photo_batch) == 1:
+            downloaded_photos = []
+            for photo_url in photo_batch:
+                try:
+                    image_data, content_type = _download_vk_file(photo_url, MAX_PHOTO_BYTES)
+                except ValueError:
+                    logger.warning(
+                        'Rejected oversized VK photo: event_id=%s max_bytes=%s',
+                        event_id, MAX_PHOTO_BYTES
+                    )
+                    notify_owner('Фотография из VK превышает лимит 10 МБ; она пропущена.')
+                    continue
+                downloaded_photos.append((image_data, content_type or 'image/jpeg'))
+            if not downloaded_photos:
+                continue
+            if len(downloaded_photos) == 1:
                 response = _request(
                     'Telegram sendPhoto', 'POST',
                     f'https://api.telegram.org/bot{TG_TOKEN}/sendPhoto',
-                    json={
-                        'chat_id':           telegram_chat_id,
-                        'photo':             photo_batch[0],
-                        'caption':           caption,
+                    data={
+                        'chat_id': telegram_chat_id,
+                        **({'caption': caption} if caption else {}),
                         'message_thread_id': message_thread_id
-                    }, timeout=(5, 15)
+                    },
+                    files={'photo': ('photo.jpg', downloaded_photos[0][0], downloaded_photos[0][1])},
+                    timeout=(10, 30)
                 )
                 _raise_for_api_error(response, 'Telegram sendPhoto')
             else:
-                media = [{'type': 'photo', 'media': photo_url} for photo_url in photo_batch]
+                media = [
+                    {'type': 'photo', 'media': f'attach://photo{index}'}
+                    for index in range(len(downloaded_photos))
+                ]
                 if caption:
                     media[0]['caption'] = caption
                 response = _request(
                     'Telegram sendMediaGroup', 'POST',
                     f'https://api.telegram.org/bot{TG_TOKEN}/sendMediaGroup',
-                    json={
-                        'chat_id':           telegram_chat_id,
-                        'media':             media,
+                    data={
+                        'chat_id': telegram_chat_id,
+                        'media': json.dumps(media),
                         'message_thread_id': message_thread_id
-                    }, timeout=(5, 15)
+                    },
+                    files={
+                        f'photo{index}': (f'photo{index}.jpg', image_data, content_type)
+                        for index, (image_data, content_type) in enumerate(downloaded_photos)
+                    },
+                    timeout=(10, 30)
                 )
                 _raise_for_api_error(response, 'Telegram sendMediaGroup')
             caption_sent = caption_sent or bool(caption)
