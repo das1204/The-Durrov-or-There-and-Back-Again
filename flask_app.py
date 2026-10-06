@@ -899,23 +899,22 @@ def _vk_group_source(group_id):
     return name, source_url
 
 
-def _vk_forward_sources(message):
+def _vk_forwarded_messages(message):
     forwarded_messages = message.get('fwd_messages')
     if not isinstance(forwarded_messages, list):
         return []
 
-    sources = []
-    seen_user_ids = set()
-    for forwarded_message in forwarded_messages:
+    collected = []
+    pending = list(forwarded_messages)
+    while pending:
+        forwarded_message = pending.pop(0)
         if not isinstance(forwarded_message, dict):
             continue
-        user_id = forwarded_message.get('from_id')
-        if not isinstance(user_id, int) or user_id <= 0 or user_id in seen_user_ids:
-            continue
-        seen_user_ids.add(user_id)
-        display_name = _vk_display_name(user_id)
-        sources.append(f'Сообщение от {display_name} (https://vk.com/id{user_id})')
-    return sources
+        collected.append(forwarded_message)
+        nested_messages = forwarded_message.get('fwd_messages')
+        if isinstance(nested_messages, list):
+            pending[0:0] = nested_messages
+    return collected
 
 
 def _vk_send_id(event_id, suffix='reply'):
@@ -992,9 +991,33 @@ def _handle_vk_message(message, event_id):
     media_files = []
     video_links = []
     wall_sources = {}
-    forward_sources = _vk_forward_sources(message)
+    forwarded_messages = _vk_forwarded_messages(message)
     unsupported_attachment = False
     attachments = message.get('attachments', [])
+    if not isinstance(attachments, list):
+        attachments = []
+    else:
+        attachments = list(attachments)
+    forwarded_texts = []
+    for forwarded_message in forwarded_messages:
+        forwarded_text = forwarded_message.get('text')
+        if isinstance(forwarded_text, str) and forwarded_text.strip():
+            forwarded_texts.append(forwarded_text.strip())
+        forwarded_attachments = forwarded_message.get('attachments')
+        if isinstance(forwarded_attachments, list):
+            attachments.extend(forwarded_attachments)
+    if forwarded_texts:
+        forwarded_body = '\n\n'.join(forwarded_texts)
+        text = f'{text}\n\n{forwarded_body}' if text else forwarded_body
+    seen_forwarded_user_ids = set()
+    for forwarded_message in forwarded_messages:
+        user_id = forwarded_message.get('from_id')
+        if not isinstance(user_id, int) or user_id <= 0 or user_id in seen_forwarded_user_ids:
+            continue
+        seen_forwarded_user_ids.add(user_id)
+        display_name = _vk_display_name(user_id)
+        forwarded_attribution = f'Сообщение от {display_name} (https://vk.com/id{user_id})'
+        text = f'{text}\n\n{forwarded_attribution}' if text else forwarded_attribution
     wall_texts = []
     if isinstance(attachments, list):
         attachments_to_process = list(attachments)
@@ -1085,9 +1108,6 @@ def _handle_vk_message(message, event_id):
     if wall_texts:
         wall_text = '\n\n'.join(wall_texts)
         text = f'{text}\n\n{wall_text}' if text else wall_text
-    if forward_sources:
-        forwarded_attribution = '\n'.join(forward_sources)
-        text = f'{text}\n\n{forwarded_attribution}' if text else forwarded_attribution
     if video_links:
         links = '\n'.join(video_links)
         text = f'{text}\n{links}' if text else links
