@@ -26,18 +26,19 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-TG_TOKEN = os.getenv('TG_TOKEN', '')
-TG_OWNER_ID = os.getenv('TG_OWNER_ID', '')
-TG_FORUM_CHAT_ID = os.getenv('TG_FORUM_CHAT_ID', '')
-TG_WEBHOOK_SECRET = os.getenv('TG_WEBHOOK_SECRET', '')
-VK_TOKEN = os.getenv('VK_TOKEN', '')
-VK_GROUP_ID = os.getenv('VK_GROUP_ID', '')
+TG_TOKEN =           os.getenv('TG_TOKEN', '')
+TG_OWNER_ID =        os.getenv('TG_OWNER_ID', '')
+TG_FORUM_CHAT_ID =   os.getenv('TG_FORUM_CHAT_ID', '')
+TG_WEBHOOK_SECRET =  os.getenv('TG_WEBHOOK_SECRET', '')
+VK_TOKEN =           os.getenv('VK_TOKEN', '')
+VK_GROUP_ID =        os.getenv('VK_GROUP_ID', '')
 VK_CALLBACK_SECRET = os.getenv('VK_CALLBACK_SECRET', '')
-VK_CONFIRMATION = os.getenv('VK_CONFIRMATION', '')
-DATABASE_URL = os.getenv('DATABASE_URL', '')
+VK_CONFIRMATION =    os.getenv('VK_CONFIRMATION', '')
+DATABASE_URL =       os.getenv('DATABASE_URL', '')
 MAX_MESSAGE_LENGTH = 3500
 MAX_PHOTO_BYTES = 10 * 1024 * 1024
 MAX_MEDIA_BYTES = 20 * 1024 * 1024
+
 _database_ready = False
 _queue_workers_pid = None
 _queue_workers_lock = threading.Lock()
@@ -380,6 +381,44 @@ def _upload_vk_document(peer_id, file_data, filename, content_type):
     access_key = saved_doc.get('access_key')
     suffix = f'_{access_key}' if isinstance(access_key, str) and access_key else ''
     return f'doc{owner_id}_{document_id}{suffix}'
+
+
+def _upload_vk_message_video(file_data, filename, content_type):
+    try:
+        group_id = abs(int(VK_GROUP_ID))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError('VK_GROUP_ID must be an integer to upload videos') from exc
+    if group_id == 0:
+        raise RuntimeError('VK_GROUP_ID must be a non-zero integer to upload videos')
+
+    server_response = _request(
+        'VK video.save', 'POST', 'https://api.vk.com/method/video.save',
+        data={
+            'name':         filename[:255],
+            'group_id':     group_id,
+            'access_token': VK_TOKEN,
+            'v':            '5.199'
+        }, timeout=(5, 15)
+    )
+    server_data = _raise_for_api_error(server_response, 'VK video.save')
+    upload_url = safe_dict_get(server_data, 'response', 'upload_url')
+    owner_id = safe_dict_get(server_data, 'response', 'owner_id')
+    video_id = safe_dict_get(server_data, 'response', 'video_id')
+    if (
+        not isinstance(upload_url, str) or not upload_url.startswith('https://')
+        or not isinstance(owner_id, int) or not isinstance(video_id, int)
+    ):
+        raise RuntimeError('VK video.save returned invalid upload details')
+
+    upload_response = _request(
+        'VK video upload', 'POST', upload_url,
+        files={'video_file': (filename, file_data, content_type)}, timeout=(10, 30)
+    )
+    _raise_for_api_error(upload_response, 'VK video upload')
+
+    access_key = safe_dict_get(server_data, 'response', 'access_key')
+    suffix = f'_{access_key}' if isinstance(access_key, str) and access_key else ''
+    return f'video{owner_id}_{video_id}{suffix}'
 
 
 def _upload_vk_message_photo(peer_id, image_data, image_content_type):
@@ -737,7 +776,10 @@ def _handle_telegram_message(message, event_id):
         if not isinstance(content_type, str) or '/' not in content_type:
             content_type = downloaded_content_type or mimetypes.guess_type(filename)[0] or 'application/octet-stream'
 
-        attachments.append(_upload_vk_document(selected['vk_user_id'], file_data, filename, content_type))
+        if media_kind == 'video':
+            attachments.append(_upload_vk_message_video(file_data, filename, content_type))
+        else:
+            attachments.append(_upload_vk_document(selected['vk_user_id'], file_data, filename, content_type))
 
     if not text and not attachments:
         reply('Поддерживаются текст, фотографии, видео, GIF и документы.')
