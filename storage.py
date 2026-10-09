@@ -30,6 +30,12 @@ CREATE TABLE IF NOT EXISTS telegram_forum_topics (
 );
 """,
 """
+CREATE TABLE IF NOT EXISTS bot_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+""",
+"""
 CREATE TABLE IF NOT EXISTS webhook_events (
     provider TEXT NOT NULL,
     event_id TEXT NOT NULL,
@@ -59,13 +65,6 @@ CREATE INDEX IF NOT EXISTS webhook_queue_provider_order
 """
 CREATE INDEX IF NOT EXISTS webhook_queue_terminal_age
     ON webhook_queue (updated_at) WHERE state IN ('sent', 'failed');
-""",
-"""
-CREATE TABLE IF NOT EXISTS outbound_rate_events (
-    id BIGSERIAL PRIMARY KEY,
-    owner_id BIGINT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
 """
 )
 
@@ -81,6 +80,27 @@ def initialize():
     with connect() as connection:
         for statement in SCHEMA_STATEMENTS:
             connection.execute(statement)
+
+
+def get_setting(key):
+    with connect() as connection:
+        result = connection.execute(
+            'SELECT value FROM bot_settings WHERE key = %s',
+            (key,)
+        ).fetchone()
+    return result['value'] if result else None
+
+
+def save_setting(key, value):
+    with connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO bot_settings (key, value)
+            VALUES (%s, %s)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """,
+            (key, str(value))
+        )
 
 
 def register_consent(vk_user_id, display_name):
@@ -377,33 +397,6 @@ def finish_webhook_events(queue_ids, succeeded):
                 """,
                 (queue_ids)
             )
-
-
-def reserve_outbound_message(owner_id):
-    with connect() as connection:
-        with connection.transaction():
-            connection.execute('SELECT pg_advisory_xact_lock(%s)', (owner_id,))
-            counts = connection.execute(
-                """
-                SELECT
-                    COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '1 minute') AS minute_count,
-                    COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '1 day') AS day_count
-                FROM outbound_rate_events
-                WHERE owner_id = %s
-                """,
-                (owner_id)
-            ).fetchone()
-            if counts['minute_count'] >= 10 or counts['day_count'] >= 1_000:
-                return False
-            connection.execute(
-                'INSERT INTO outbound_rate_events (owner_id) VALUES (%s)',
-                (owner_id)
-            )
-            connection.execute(
-                "DELETE FROM outbound_rate_events WHERE owner_id = %s AND created_at < NOW() - INTERVAL '1 day'",
-                (owner_id)
-            )
-    return True
 
 
 def finish_event(provider, event_id, state):
