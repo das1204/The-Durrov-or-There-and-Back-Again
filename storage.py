@@ -3,6 +3,8 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+TELEGRAM_MEDIA_GROUP_DEBOUNCE_SECONDS = 3
+
 
 SCHEMA_STATEMENTS = (
 """
@@ -64,7 +66,7 @@ CREATE TABLE IF NOT EXISTS outbound_rate_events (
     owner_id BIGINT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-""",
+"""
 )
 
 
@@ -92,7 +94,7 @@ def register_consent(vk_user_id, display_name):
                 consented_at = NOW(),
                 revoked_at = NULL
             """,
-            (vk_user_id, display_name),
+            (vk_user_id, display_name)
         )
 
 
@@ -101,11 +103,11 @@ def revoke_consent(vk_user_id):
         with connection.transaction():
             result = connection.execute(
                 "UPDATE vk_contacts SET revoked_at = NOW() WHERE vk_user_id = %s AND revoked_at IS NULL",
-                (vk_user_id,),
+                (vk_user_id)
             )
             connection.execute(
                 "DELETE FROM telegram_selection WHERE vk_user_id = %s",
-                (vk_user_id,),
+                (vk_user_id)
             )
     return result.rowcount > 0
 
@@ -122,7 +124,7 @@ def select_contact(owner_id, vk_user_id):
         with connection.transaction():
             contact = connection.execute(
                 "SELECT vk_user_id FROM vk_contacts WHERE vk_user_id = %s AND revoked_at IS NULL FOR UPDATE",
-                (vk_user_id,),
+                (vk_user_id)
             ).fetchone()
             if contact is None:
                 return False
@@ -133,7 +135,7 @@ def select_contact(owner_id, vk_user_id):
                 ON CONFLICT (owner_id) DO UPDATE
                 SET vk_user_id = EXCLUDED.vk_user_id, updated_at = NOW()
                 """,
-                (owner_id, vk_user_id),
+                (owner_id, vk_user_id)
             )
     return True
 
@@ -147,7 +149,7 @@ def get_selected_contact(owner_id):
             JOIN vk_contacts AS c ON c.vk_user_id = s.vk_user_id
             WHERE s.owner_id = %s AND c.revoked_at IS NULL
             """,
-            (owner_id,),
+            (owner_id)
         ).fetchone()
 
 
@@ -159,7 +161,7 @@ def get_forum_topic(vk_user_id):
             FROM telegram_forum_topics
             WHERE vk_user_id = %s
             """,
-            (vk_user_id,),
+            (vk_user_id)
         ).fetchone()
 
 
@@ -172,7 +174,7 @@ def save_forum_topic(vk_user_id, message_thread_id):
             ON CONFLICT (vk_user_id) DO UPDATE
             SET message_thread_id = EXCLUDED.message_thread_id
             """,
-            (vk_user_id, message_thread_id),
+            (vk_user_id, message_thread_id)
         )
 
 
@@ -185,7 +187,7 @@ def get_forum_contact(message_thread_id):
             JOIN vk_contacts AS c ON c.vk_user_id = t.vk_user_id
             WHERE t.message_thread_id = %s AND c.revoked_at IS NULL
             """,
-            (message_thread_id,),
+            (message_thread_id)
         ).fetchone()
 
 
@@ -198,7 +200,7 @@ def get_forum_contact_by_vk_user(vk_user_id):
             JOIN vk_contacts AS c ON c.vk_user_id = t.vk_user_id
             WHERE t.vk_user_id = %s AND c.revoked_at IS NULL
             """,
-            (vk_user_id,),
+            (vk_user_id)
         ).fetchone()
 
 
@@ -220,7 +222,7 @@ def claim_event(provider, event_id):
                 ON CONFLICT DO NOTHING
                 RETURNING event_id
                 """,
-                (provider, str(event_id)),
+                (provider, str(event_id))
             ).fetchone()
             if inserted is not None:
                 return True
@@ -233,7 +235,7 @@ def claim_event(provider, event_id):
                        (state = 'processing' AND updated_at < NOW() - INTERVAL '5 minutes'))
                 RETURNING event_id
                 """,
-                (provider, str(event_id)),
+                (provider, str(event_id))
             ).fetchone()
             if reclaimed is not None:
                 return True
@@ -253,7 +255,7 @@ def enqueue_webhook_event(provider, event_id, payload):
         and isinstance(message, dict)
         and isinstance(message.get('media_group_id'), str)
     )
-    delay_seconds = 1.5 if is_media_group else 0
+    delay_seconds = TELEGRAM_MEDIA_GROUP_DEBOUNCE_SECONDS if is_media_group else 0
     with connect() as connection:
         connection.execute(
             """
@@ -268,8 +270,18 @@ def enqueue_webhook_event(provider, event_id, payload):
             ON CONFLICT (provider, event_id) DO NOTHING
             RETURNING queue_id
             """,
-            (provider, str(event_id), Jsonb(payload), delay_seconds),
+            (provider, str(event_id), Jsonb(payload), delay_seconds)
         ).fetchone()
+        if inserted is not None and is_media_group:
+            connection.execute(
+                """
+                UPDATE webhook_queue
+                SET available_at = NOW() + (%s * INTERVAL '1 second')
+                WHERE provider = %s AND state = 'queued'
+                  AND payload->'message'->>'media_group_id' = %s
+                """,
+                (delay_seconds, provider, message['media_group_id'])
+            )
     return inserted is not None
 
 
@@ -283,7 +295,7 @@ def claim_next_webhook_events(provider):
                 WHERE provider = %s AND state = 'processing'
                   AND updated_at < NOW() - INTERVAL '5 minutes'
                 """,
-                (provider,),
+                (provider)
             )
             first = connection.execute(
                 """
@@ -300,7 +312,7 @@ def claim_next_webhook_events(provider):
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
                 """,
-                (provider,),
+                (provider)
             ).fetchone()
             if first is None:
                 return []
@@ -317,7 +329,7 @@ def claim_next_webhook_events(provider):
                     ORDER BY queue_id
                     FOR UPDATE
                     """,
-                    (provider, first['queue_id']),
+                    (provider, first['queue_id'])
                 ).fetchall()
                 rows = []
                 for row in queued_rows:
@@ -336,7 +348,7 @@ def claim_next_webhook_events(provider):
                 WHERE queue_id = ANY(%s)
                 RETURNING queue_id, event_id, payload, attempts
                 """,
-                (queue_ids,),
+                (queue_ids)
             ).fetchall()
             return sorted(claimed, key=lambda row: row['queue_id'])
 
@@ -351,7 +363,7 @@ def finish_webhook_events(queue_ids, succeeded):
                 UPDATE webhook_queue SET state = 'sent', updated_at = NOW()
                 WHERE queue_id = ANY(%s) AND state = 'processing'
                 """,
-                (queue_ids,),
+                (queue_ids,)
             )
         else:
             connection.execute(
@@ -363,7 +375,7 @@ def finish_webhook_events(queue_ids, succeeded):
                     updated_at = NOW()
                 WHERE queue_id = ANY(%s) AND state = 'processing'
                 """,
-                (queue_ids,),
+                (queue_ids)
             )
 
 
@@ -379,17 +391,17 @@ def reserve_outbound_message(owner_id):
                 FROM outbound_rate_events
                 WHERE owner_id = %s
                 """,
-                (owner_id,),
+                (owner_id)
             ).fetchone()
             if counts['minute_count'] >= 10 or counts['day_count'] >= 1_000:
                 return False
             connection.execute(
                 'INSERT INTO outbound_rate_events (owner_id) VALUES (%s)',
-                (owner_id,),
+                (owner_id)
             )
             connection.execute(
                 "DELETE FROM outbound_rate_events WHERE owner_id = %s AND created_at < NOW() - INTERVAL '1 day'",
-                (owner_id,),
+                (owner_id)
             )
     return True
 
@@ -403,5 +415,5 @@ def finish_event(provider, event_id, state):
             UPDATE webhook_events SET state = %s, updated_at = NOW()
             WHERE provider = %s AND event_id = %s
             """,
-            (state, provider, str(event_id)),
+            (state, provider, str(event_id))
         )
