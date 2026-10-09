@@ -6,11 +6,13 @@ import mimetypes
 import os
 import re
 import random
+import sys
 import threading
 import time
 import traceback
 import requests
-from flask import Flask, jsonify, request
+from datetime import datetime, timezone
+from flask import Flask, has_request_context, jsonify, request
 from dotenv import load_dotenv
 from urllib.parse import urljoin, urlparse
 from werkzeug.exceptions import (
@@ -39,10 +41,17 @@ DATABASE_URL =       os.getenv('DATABASE_URL', '')
 MAX_MESSAGE_LENGTH = 3500
 MAX_PHOTO_BYTES = 10 * 1024 * 1024
 MAX_MEDIA_BYTES = 20 * 1024 * 1024
+VIDEO_UNAVAILABLE_NOTICE = 'Отправка видео доступна только в полной версии.'
+VIDEO_EXTENSIONS = {
+    '.3gp', '.avi', '.flv', '.m4v', '.mkv', '.mov', '.mp4', '.mpeg', '.mpg', '.webm', '.wmv'
+}
 
 _database_ready = False
 _queue_workers_pid = None
 _queue_workers_lock = threading.Lock()
+_errors_topic_lock = threading.Lock()
+_errors_topic_id = None
+_error_context = threading.local()
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 1024 * 1024
@@ -65,7 +74,12 @@ def handle_unexpected_error(error):
             request.method, request.path, error.code, error.name
         )
         return error
-    _log_exception('Unhandled Flask error: path=%s method=%s', request.path, request.method)
+    _log_exception(
+        'Unhandled Flask error: path=%s method=%s',
+        request.path,
+        request.method,
+        exception=error
+    )
     return jsonify({'ok': False, 'error': 'internal_server_error'}), 500
 
 
@@ -127,10 +141,67 @@ def _raise_for_api_error(response, service_name):
     return payload
 
 
-def _log_exception(message, *args):
+def _log_exception(message, *args, exception=None):
     formatted_traceback = _redact_secrets(traceback.format_exc())
     log_message = message % args if args else message
     logger.error('%s\n%s', log_message, formatted_traceback.rstrip())
+    exception = exception or sys.exc_info()[1]
+    exception_type = type(exception).__name__ if exception else 'UnknownError'
+    error_details = str(exception) if exception else log_message
+    _report_bot_error(exception_type, error_details)
+
+
+def _report_bot_error(error_type, error_details):
+    if getattr(_error_context, 'reporting', False):
+        return
+    topic_id = _errors_topic_id
+    if topic_id is None:
+        return
+    context = getattr(_error_context, 'chat', None)
+    if not context and has_request_context():
+        context = f'HTTP {request.method} {request.path}'
+    if not context:
+        context = 'не определён'
+    description = _redact_secrets(' '.join(str(error_details).split()))[:1200]
+    report = (
+        f'{datetime.now(timezone.utc).isoformat(timespec="seconds")} Ошибка бота в чате с {context}\n'
+        f'Тип: {error_type}\n'
+        f'Описание: {description}'
+    )
+    _error_context.reporting = True
+    try:
+        send_telegram_message(_forum_chat_id(), report, message_thread_id=topic_id)
+    except Exception as reporting_error:
+        logger.error(
+            'Failed to send bot error report: %s: %s',
+            type(reporting_error).__name__,
+            _redact_secrets(str(reporting_error))
+        )
+    finally:
+        _error_context.reporting = False
+
+
+def _ensure_errors_topic():
+    global _errors_topic_id
+    if _errors_topic_id is not None:
+        return _errors_topic_id
+    with _errors_topic_lock:
+        if _errors_topic_id is not None:
+            return _errors_topic_id
+        configured_topic_id = storage.get_setting('errors_topic_id')
+        if configured_topic_id is not None:
+            try:
+                _errors_topic_id = int(configured_topic_id)
+            except ValueError as exc:
+                raise RuntimeError('Stored Errors forum topic id is invalid') from exc
+            if _errors_topic_id <= 0:
+                raise RuntimeError('Stored Errors forum topic id must be positive')
+            return _errors_topic_id
+        topic_id = create_telegram_forum_topic('Errors')
+        storage.save_setting('errors_topic_id', topic_id)
+        _errors_topic_id = topic_id
+        logger.info('Created Errors Telegram forum topic: message_thread_id=%s', topic_id)
+        return topic_id
 
 
 def _request(service_name, method, url, **kwargs):
@@ -384,52 +455,6 @@ def _upload_vk_document(peer_id, file_data, filename, content_type):
     return f'doc{owner_id}_{document_id}{suffix}'
 
 
-def _upload_vk_message_video(file_data, filename, content_type):
-    try:
-        group_id = abs(int(VK_GROUP_ID))
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError('VK_GROUP_ID must be an integer to upload videos') from exc
-    if group_id == 0:
-        raise RuntimeError('VK_GROUP_ID must be a non-zero integer to upload videos')
-
-    logger.info(
-        'Starting VK video upload: filename=%s size_bytes=%s group_id=%s',
-        filename, len(file_data), group_id
-    )
-    server_response = _request(
-        'VK video.save', 'POST', 'https://api.vk.com/method/video.save',
-        data={
-            'name':         filename[:255],
-            'group_id':     group_id,
-            'access_token': VK_TOKEN,
-            'v':            '5.199'
-        }, timeout=(5, 15)
-    )
-    server_data = _raise_for_api_error(server_response, 'VK video.save')
-    upload_url = safe_dict_get(server_data, 'response', 'upload_url')
-    owner_id = safe_dict_get(server_data, 'response', 'owner_id')
-    video_id = safe_dict_get(server_data, 'response', 'video_id')
-    if (
-        not isinstance(upload_url, str) or not upload_url.startswith('https://')
-        or not isinstance(owner_id, int) or not isinstance(video_id, int)
-    ):
-        raise RuntimeError('VK video.save returned invalid upload details')
-
-    upload_response = _request(
-        'VK video upload', 'POST', upload_url,
-        files={'video_file': (filename, file_data, content_type)}, timeout=(10, 30)
-    )
-    _raise_for_api_error(upload_response, 'VK video upload')
-
-    access_key = safe_dict_get(server_data, 'response', 'access_key')
-    suffix = f'_{access_key}' if isinstance(access_key, str) and access_key else ''
-    logger.info(
-        'VK video upload completed: owner_id=%s video_id=%s size_bytes=%s',
-        owner_id, video_id, len(file_data)
-    )
-    return f'video{owner_id}_{video_id}{suffix}'
-
-
 def _upload_vk_message_photo(peer_id, image_data, image_content_type):
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
@@ -541,6 +566,21 @@ def _command(text):
     if not isinstance(text, str) or not text.strip():
         return ''
     return text.strip().split(maxsplit=1)[0].split('@', 1)[0].lower()
+
+
+def _is_video_file(filename, content_type):
+    return (
+        isinstance(content_type, str) and content_type.lower().startswith('video/')
+    ) or (
+        isinstance(filename, str)
+        and os.path.splitext(filename)[1].lower() in VIDEO_EXTENSIONS
+    )
+
+
+def _append_video_notice(text):
+    separator = '\n\n' if text else ''
+    max_text_length = MAX_MESSAGE_LENGTH - len(separator) - len(VIDEO_UNAVAILABLE_NOTICE)
+    return f'{text[:max_text_length].rstrip()}{separator}{VIDEO_UNAVAILABLE_NOTICE}'
 
 
 def _telegram_forward_source(message):
@@ -679,6 +719,8 @@ def _handle_telegram_message(message, event_id):
         send_telegram_message(telegram_chat_id, reply_text, message_thread_id=message_thread_id)
 
     text = message.get('text') or message.get('caption') or ''
+    if not isinstance(text, str):
+        text = ''
     command = _command(message.get('text'))
     logger.info(
         'Processing Telegram message %s: command=%s, has_text=%s, has_photo=%s, has_video=%s, has_document=%s',
@@ -701,16 +743,14 @@ def _handle_telegram_message(message, event_id):
     is_gif_document = (
         isinstance(document_name, str) and document_name.lower().endswith('.gif')
     ) or document_mime == 'image/gif'
-    video_extensions = {'.3gp', '.avi', '.flv', '.m4v', '.mov', '.mp4', '.mpeg', '.mpg', '.wmv'}
-    is_video_document = (
-        isinstance(document_mime, str) and document_mime.startswith('video/')
-    ) or (
-        isinstance(document_name, str)
-        and os.path.splitext(document_name)[1].lower() in video_extensions
-    )
+    is_video_document = _is_video_file(document_name, document_mime)
+    has_video = any(
+        isinstance(message.get(field), dict)
+        for field in ('video_note', 'video', 'animation')
+    ) or is_video_document
     unsupported_fields = {'audio', 'voice', 'sticker', 'contact', 'location', 'venue', 'poll', 'dice'}
     if unsupported_fields.intersection(message):
-        reply('Поддерживаются текст, фотографии, видео, GIF и документы.')
+        reply('Отправка видео пока недоступна. Разработка продолжается, наверное...')
         return
 
     if not isinstance(message_thread_id, int):
@@ -726,11 +766,6 @@ def _handle_telegram_message(message, event_id):
     forward_source = _telegram_forward_source(message)
     if forward_source:
         text = f'{text}\n\n{forward_source}' if text else forward_source
-    if not storage.reserve_outbound_message(owner_id):
-        logger.warning('Outbound rate limit reached: provider=telegram event_id=%s owner_id=%s', event_id, owner_id)
-        reply('Достигнут лимит сообщений: не более 10 в минуту и 1000 в сутки.')
-        return
-
     attachments = []
     photo_groups = message.get('media_group_photos')
     if photo_groups is None:
@@ -756,22 +791,10 @@ def _handle_telegram_message(message, event_id):
 
     media_message = None
     media_kind = None
-    if isinstance(message.get('video_note'), dict):
-        media_message = message['video_note']
-        media_kind = 'video'
-    elif isinstance(message.get('video'), dict):
-        media_message = message['video']
-        media_kind = 'video'
-    elif isinstance(message.get('animation'), dict):
-        media_message = message['animation']
-        media_kind = 'animation'
-    elif is_gif_document and isinstance(document, dict):
+    if is_gif_document and isinstance(document, dict):
         media_message = document
         media_kind = 'gif'
-    elif is_video_document and isinstance(document, dict):
-        media_message = document
-        media_kind = 'video'
-    elif isinstance(document, dict):
+    elif isinstance(document, dict) and not is_video_document:
         media_message = document
         media_kind = 'document'
 
@@ -802,13 +825,14 @@ def _handle_telegram_message(message, event_id):
         if not isinstance(content_type, str) or '/' not in content_type:
             content_type = downloaded_content_type or mimetypes.guess_type(filename)[0] or 'application/octet-stream'
 
-        if media_kind == 'video':
-            attachments.append(_upload_vk_message_video(file_data, filename, content_type))
-        else:
-            attachments.append(_upload_vk_document(selected['vk_user_id'], file_data, filename, content_type))
+        attachments.append(
+            _upload_vk_document(selected['vk_user_id'], file_data, filename, content_type)
+        )
 
+    if has_video:
+        text = _append_video_notice(text)
     if not text and not attachments:
-        reply('Поддерживаются текст, фотографии, видео, GIF и документы.')
+        reply('Поддерживаются текст, фотографии, GIF и документы; видео не пересылаются.')
         return
     current_selection = storage.get_forum_contact(message_thread_id)
     if current_selection is None or current_selection['vk_user_id'] != selected['vk_user_id']:
@@ -857,12 +881,31 @@ def _handle_telegram_album(messages, event_ids):
     _handle_telegram_message(combined, event_ids[0])
 
 
+def _event_chat_context(provider, payload):
+    if provider == 'telegram':
+        message = safe_dict_get(payload, 'message')
+        if not isinstance(message, dict):
+            message = safe_dict_get(payload, 'callback_query', 'message')
+        chat_id = safe_dict_get(message, 'chat', 'id')
+        thread_id = safe_dict_get(message, 'message_thread_id')
+        if chat_id is not None:
+            topic = f', тема={thread_id}' if thread_id is not None else ''
+            return f'Telegram chat_id={chat_id}{topic}'
+    elif provider == 'vk':
+        user_id = safe_dict_get(payload, 'from_id')
+        if user_id is not None:
+            return f'VK user_id={user_id}'
+    return f'{provider}: чат не определён'
+
+
 def _queue_worker(provider):
     while True:
         try:
             events = storage.claim_next_webhook_events(provider)
         except Exception:
+            _error_context.chat = f'{provider}: очередь вебхуков'
             _log_exception('Failed to claim webhook queue item: provider=%s', provider)
+            _error_context.chat = None
             time.sleep(2)
             continue
         if not events:
@@ -871,6 +914,7 @@ def _queue_worker(provider):
 
         queue_ids = [event['queue_id'] for event in events]
         event_ids = ','.join(event['event_id'] for event in events)
+        _error_context.chat = _event_chat_context(provider, events[0]['payload'])
         try:
             if provider == 'telegram':
                 messages = [safe_dict_get(event['payload'], 'message') for event in events]
@@ -890,6 +934,8 @@ def _queue_worker(provider):
                 _log_exception(
                     'Failed to update queued webhook events: provider=%s event_ids=%s', provider, event_ids
                 )
+        finally:
+            _error_context.chat = None
 
 
 def _start_queue_workers():
@@ -941,10 +987,13 @@ def tg_webhook():
     )
     try:
         ensure_database()
+        _ensure_errors_topic()
         _start_queue_workers()
         queued = storage.enqueue_webhook_event('telegram', event_id, update)
     except Exception:
+        _error_context.chat = _event_chat_context('telegram', update)
         _log_exception('Failed to enqueue Telegram webhook event_id=%s', event_id)
+        _error_context.chat = None
         return jsonify({'ok': False, 'error': 'telegram_queue_unavailable'}), 503
     if not queued:
         logger.info('Ignoring duplicate Telegram webhook event_id=%s', event_id)
@@ -1013,94 +1062,6 @@ def _vk_forwarded_messages(message):
     return collected
 
 
-def _is_vk_video_message(attachment):
-    if attachment.get('type') == 'video_message':
-        return True
-    if attachment.get('is_video_message') is True or attachment.get('is_video_message') == 1:
-        return True
-    video = attachment.get('video')
-    if not isinstance(video, dict):
-        return False
-    return (
-        video.get('is_video_message') is True
-        or video.get('is_video_message') == 1
-        or video.get('type') == 'video_message'
-    )
-
-
-def _vk_video_message_url(attachment):
-    if attachment.get('type') == 'video_message':
-        video = attachment.get('video_message')
-    else:
-        video = attachment.get('video')
-    if not isinstance(video, dict):
-        return None
-
-    for key in ('link_mp4', 'video_url', 'url', 'link'):
-        url = video.get(key)
-        if isinstance(url, str) and url:
-            return url
-
-    files = video.get('files')
-    if isinstance(files, dict):
-        mp4_files = sorted(
-            (
-                (int(match.group(1)), url)
-                for key, url in files.items()
-                if isinstance(key, str)
-                and (match := re.fullmatch(r'mp4_(\d+)', key))
-                and isinstance(url, str)
-                and url
-            ),
-            reverse=True
-        )
-        if mp4_files:
-            return mp4_files[0][1]
-    return None
-
-
-def _fetch_vk_video_message_url(attachment, event_id):
-    video = attachment.get('video_message')
-    if not isinstance(video, dict):
-        video = attachment.get('video')
-    if not isinstance(video, dict):
-        return None
-
-    owner_id = video.get('owner_id')
-    video_id = video.get('id')
-    if not isinstance(owner_id, int) or not isinstance(video_id, int):
-        return None
-
-    access_key = video.get('access_key')
-    video_identifier = f'{owner_id}_{video_id}'
-    if isinstance(access_key, str) and access_key:
-        video_identifier = f'{video_identifier}_{access_key}'
-    response = _request(
-        'VK video.get', 'GET', 'https://api.vk.com/method/video.get',
-        params={'videos': video_identifier, 'access_token': VK_TOKEN, 'v': '5.199'},
-        timeout=(5, 15)
-    )
-    data = _raise_for_api_error(response, 'VK video.get')
-    videos = safe_dict_get(data, 'response')
-    if isinstance(videos, dict):
-        videos = videos.get('items')
-    if not isinstance(videos, list) or not videos or not isinstance(videos[0], dict):
-        logger.warning(
-            'VK video.get returned no video message files: event_id=%s owner_id=%s video_id=%s',
-            event_id, owner_id, video_id
-        )
-        return None
-
-    url = _vk_video_message_url({'video': videos[0]})
-    if url:
-        return url
-    logger.warning(
-        'VK video.get returned no MP4 URL: event_id=%s owner_id=%s video_id=%s',
-        event_id, owner_id, video_id
-    )
-    return None
-
-
 def _vk_send_id(event_id, suffix='reply'):
     return f'vk:{event_id}:{suffix}'
 
@@ -1140,13 +1101,13 @@ def _handle_vk_message(message, event_id):
     if command == '/disconnect':
         storage.revoke_consent(vk_user_id)
         send_vk_message(
-            vk_user_id, 'Согласие отозвано. Новые сообщения через мост пересылаться не будут.',
+            vk_user_id, 'Согласие отозвано. Новые сообщения пересылаться не будут.',
             event_id=_vk_send_id(event_id, 'disconnect')
         )
         return
     if command in {'/start', '/help'}:
         send_vk_message(
-            vk_user_id, 'Чтобы разрешить сообщения через мост, отправьте /connect. Для прекращения и отзыва согласия отправьте /disconnect.',
+            vk_user_id, 'Чтобы разрешить сообщения, отправьте /connect. Для прекращения и отзыва согласия отправьте /disconnect.',
             event_id=_vk_send_id(event_id, 'help')
         )
         return
@@ -1163,7 +1124,7 @@ def _handle_vk_message(message, event_id):
 
     photo_urls = []
     media_files = []
-    video_links = []
+    has_video = False
     wall_sources = {}
     forwarded_messages = _vk_forwarded_messages(message)
     unsupported_attachment = False
@@ -1238,54 +1199,7 @@ def _handle_vk_message(message, event_id):
                     unsupported_attachment = True
                 continue
             if attachment_type in {'video', 'video_message'}:
-                if _is_vk_video_message(item):
-                    video_url = _vk_video_message_url(item)
-                    if not video_url:
-                        try:
-                            video_url = _fetch_vk_video_message_url(item, event_id)
-                        except RuntimeError:
-                            _log_exception(
-                                'Failed to resolve VK video message URL: event_id=%s',
-                                event_id
-                            )
-                            video_url = None
-                    if not _is_vk_document_url(video_url):
-                        try:
-                            video_host = urlparse(video_url).hostname
-                        except (TypeError, ValueError):
-                            video_host = None
-                        logger.warning(
-                            'Skipping VK video message with invalid URL: event_id=%s host=%s',
-                            event_id, video_host or 'missing'
-                        )
-                        unsupported_attachment = True
-                        continue
-                    media_files.append(('video', video_url, 'video_message.mp4'))
-                    logger.info(
-                        'Queued VK video message for Telegram upload: event_id=%s host=%s',
-                        event_id, urlparse(video_url).hostname
-                    )
-                    continue
-                if attachment_type == 'video_message':
-                    logger.warning(
-                        'Skipping VK video message without a downloadable video: event_id=%s', event_id
-                    )
-                    unsupported_attachment = True
-                    continue
-                video = item.get('video')
-                owner_id = video.get('owner_id') if isinstance(video, dict) else None
-                video_id = video.get('id') if isinstance(video, dict) else None
-                if isinstance(owner_id, int) and isinstance(video_id, int):
-                    video_link = f'https://vk.com/video{owner_id}_{video_id}'
-                    access_key = video.get('access_key')
-                    if isinstance(access_key, str) and access_key and all(
-                        character.isalnum() or character in '_-' for character in access_key
-                    ):
-                        video_link += f'?access_key={access_key}'
-                    video_links.append(video_link)
-                else:
-                    logger.warning('Skipping VK video with invalid identifiers: event_id=%s', event_id)
-                    unsupported_attachment = True
+                has_video = True
                 continue
             if attachment_type == 'doc':
                 document = item.get('doc')
@@ -1311,12 +1225,11 @@ def _handle_vk_message(message, event_id):
                 filename = _safe_filename(title, f'document.{extension}' if extension else 'document')
                 if extension and not filename.lower().endswith(f'.{extension.lower()}'):
                     filename = f'{filename}.{extension}'
+                if _is_video_file(filename, document_mime):
+                    has_video = True
+                    continue
                 if extension.lower() == 'gif':
                     media_kind = 'animation'
-                elif (
-                    isinstance(document_mime, str) and document_mime.startswith('video/')
-                ) or extension.lower() in {'3gp', 'avi', 'flv', 'm4v', 'mov', 'mp4', 'mpeg', 'mpg', 'wmv'}:
-                    media_kind = 'video'
                 else:
                     media_kind = 'document'
                 media_files.append((media_kind, document_url, filename))
@@ -1327,22 +1240,16 @@ def _handle_vk_message(message, event_id):
     if wall_texts:
         wall_text = '\n\n'.join(wall_texts)
         text = f'{text}\n\n{wall_text}' if text else wall_text
-    if video_links:
-        links = '\n'.join(video_links)
-        text = f'{text}\n{links}' if text else links
     source_attribution = ''
     if wall_sources:
         sources = '; '.join(f'{name} ({source_url})' for name, source_url in wall_sources.values())
         source_attribution = f'Источник: {sources}'
         text = f'{text}\n\n{source_attribution}' if text else source_attribution
     if unsupported_attachment:
-        notify_owner('Часть вложений VK пропущена: поддерживаются фотографии, видео, GIF и документы.')
+        notify_owner('Часть вложений VK пропущена: поддерживаются фотографии, GIF и документы.')
+    if has_video:
+        text = _append_video_notice(text)
     if not text and not photo_urls and not media_files:
-        return
-    if not storage.reserve_outbound_message(_owner_id()):
-        logger.warning(
-            'Outbound rate limit reached: provider=vk event_id=%s owner_id=%s', event_id, _owner_id()
-        )
         return
     current_contact = storage.get_forum_contact_by_vk_user(vk_user_id)
     if (current_contact is None or current_contact['message_thread_id'] != message_thread_id):
@@ -1418,9 +1325,7 @@ def _handle_vk_message(message, event_id):
             continue
         content_type = content_type or mimetypes.guess_type(filename)[0] or 'application/octet-stream'
         caption = text[:1024] if text and not caption_sent else ''
-        if media_kind == 'video':
-            telegram_method, field_name = 'sendVideo', 'video'
-        elif media_kind == 'animation':
+        if media_kind == 'animation':
             telegram_method, field_name = 'sendAnimation', 'animation'
         else:
             telegram_method, field_name = 'sendDocument', 'document'
@@ -1484,10 +1389,13 @@ def vk_callback():
 
     try:
         ensure_database()
+        _ensure_errors_topic()
         _start_queue_workers()
         queued = storage.enqueue_webhook_event('vk', event_id, message)
     except Exception:
+        _error_context.chat = _event_chat_context('vk', message)
         _log_exception('Failed to enqueue VK webhook event_id=%s', event_id)
+        _error_context.chat = None
         return jsonify({'ok': False, 'error': 'vk_queue_unavailable'}), 503
     if not queued:
         logger.info('Ignoring duplicate VK webhook event_id=%s', event_id)
