@@ -123,11 +123,11 @@ def revoke_consent(vk_user_id):
         with connection.transaction():
             result = connection.execute(
                 "UPDATE vk_contacts SET revoked_at = NOW() WHERE vk_user_id = %s AND revoked_at IS NULL",
-                (vk_user_id)
+                (vk_user_id,)
             )
             connection.execute(
                 "DELETE FROM telegram_selection WHERE vk_user_id = %s",
-                (vk_user_id)
+                (vk_user_id,)
             )
     return result.rowcount > 0
 
@@ -144,7 +144,7 @@ def select_contact(owner_id, vk_user_id):
         with connection.transaction():
             contact = connection.execute(
                 "SELECT vk_user_id FROM vk_contacts WHERE vk_user_id = %s AND revoked_at IS NULL FOR UPDATE",
-                (vk_user_id)
+                (vk_user_id,)
             ).fetchone()
             if contact is None:
                 return False
@@ -169,7 +169,7 @@ def get_selected_contact(owner_id):
             JOIN vk_contacts AS c ON c.vk_user_id = s.vk_user_id
             WHERE s.owner_id = %s AND c.revoked_at IS NULL
             """,
-            (owner_id)
+            (owner_id,)
         ).fetchone()
 
 
@@ -181,7 +181,7 @@ def get_forum_topic(vk_user_id):
             FROM telegram_forum_topics
             WHERE vk_user_id = %s
             """,
-            (vk_user_id)
+            (vk_user_id,)
         ).fetchone()
 
 
@@ -207,7 +207,7 @@ def get_forum_contact(message_thread_id):
             JOIN vk_contacts AS c ON c.vk_user_id = t.vk_user_id
             WHERE t.message_thread_id = %s AND c.revoked_at IS NULL
             """,
-            (message_thread_id)
+            (message_thread_id,)
         ).fetchone()
 
 
@@ -220,7 +220,7 @@ def get_forum_contact_by_vk_user(vk_user_id):
             JOIN vk_contacts AS c ON c.vk_user_id = t.vk_user_id
             WHERE t.vk_user_id = %s AND c.revoked_at IS NULL
             """,
-            (vk_user_id)
+            (vk_user_id,)
         ).fetchone()
 
 
@@ -315,7 +315,7 @@ def claim_next_webhook_events(provider):
                 WHERE provider = %s AND state = 'processing'
                   AND updated_at < NOW() - INTERVAL '5 minutes'
                 """,
-                (provider)
+                (provider,)
             )
             first = connection.execute(
                 """
@@ -332,7 +332,7 @@ def claim_next_webhook_events(provider):
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
                 """,
-                (provider)
+                (provider,)
             ).fetchone()
             if first is None:
                 return []
@@ -368,9 +368,23 @@ def claim_next_webhook_events(provider):
                 WHERE queue_id = ANY(%s)
                 RETURNING queue_id, event_id, payload, attempts
                 """,
-                (queue_ids)
+                (queue_ids,)
             ).fetchall()
             return sorted(claimed, key=lambda row: row['queue_id'])
+
+
+def peek_next_webhook_event(provider):
+    with connect() as connection:
+        return connection.execute(
+            """
+            SELECT payload
+            FROM webhook_queue
+            WHERE provider = %s AND state IN ('queued', 'processing')
+            ORDER BY queue_id
+            LIMIT 1
+            """,
+            (provider,)
+        ).fetchone()
 
 
 def finish_webhook_events(queue_ids, succeeded):
@@ -395,7 +409,7 @@ def finish_webhook_events(queue_ids, succeeded):
                     updated_at = NOW()
                 WHERE queue_id = ANY(%s) AND state = 'processing'
                 """,
-                (queue_ids)
+                (queue_ids,)
             )
 
 

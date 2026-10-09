@@ -12,7 +12,7 @@ import time
 import traceback
 import requests
 from datetime import datetime, timezone
-from flask import Flask, has_request_context, jsonify, request
+from flask import Flask, jsonify, request
 from dotenv import load_dotenv
 from urllib.parse import urljoin, urlparse
 from werkzeug.exceptions import (
@@ -157,14 +157,15 @@ def _report_bot_error(error_type, error_details):
     topic_id = _errors_topic_id
     if topic_id is None:
         return
-    context = getattr(_error_context, 'chat', None)
-    if not context and has_request_context():
-        context = f'HTTP {request.method} {request.path}'
-    if not context:
-        context = 'не определён'
+    chat_name = getattr(_error_context, 'chat', None)
+    if not isinstance(chat_name, str) or not chat_name.strip():
+        chat_name = None
+    else:
+        chat_name = chat_name.strip()
     description = _redact_secrets(' '.join(str(error_details).split()))[:1200]
+    chat_description = f' в чате с {chat_name}' if chat_name else ''
     report = (
-        f'{datetime.now(timezone.utc).isoformat(timespec="seconds")} Ошибка бота в чате с {context}\n'
+        f'{datetime.now(timezone.utc).isoformat(timespec="seconds")} Ошибка{chat_description}\n'
         f'Тип: {error_type}\n'
         f'Описание: {description}'
     )
@@ -886,16 +887,33 @@ def _event_chat_context(provider, payload):
         message = safe_dict_get(payload, 'message')
         if not isinstance(message, dict):
             message = safe_dict_get(payload, 'callback_query', 'message')
-        chat_id = safe_dict_get(message, 'chat', 'id')
         thread_id = safe_dict_get(message, 'message_thread_id')
-        if chat_id is not None:
-            topic = f', тема={thread_id}' if thread_id is not None else ''
-            return f'Telegram chat_id={chat_id}{topic}'
+        if not isinstance(thread_id, int):
+            return None
+        try:
+            contact = storage.get_forum_contact(thread_id)
+        except Exception as error:
+            logger.warning(
+                'Could not resolve Telegram topic contact for error report: thread_id=%s error=%s',
+                thread_id, type(error).__name__
+            )
+            return None
+        if contact and isinstance(contact.get('display_name'), str) and contact['display_name'].strip():
+            return contact['display_name'].strip()
     elif provider == 'vk':
         user_id = safe_dict_get(payload, 'from_id')
         if user_id is not None:
-            return f'VK user_id={user_id}'
-    return f'{provider}: чат не определён'
+            try:
+                contact = storage.get_forum_contact_by_vk_user(user_id)
+            except Exception as error:
+                logger.warning(
+                    'Could not resolve VK contact for error report: user_id=%s error=%s',
+                    user_id, type(error).__name__
+                )
+                return None
+            if contact and isinstance(contact.get('display_name'), str) and contact['display_name'].strip():
+                return contact['display_name'].strip()
+    return None
 
 
 def _queue_worker(provider):
@@ -903,7 +921,16 @@ def _queue_worker(provider):
         try:
             events = storage.claim_next_webhook_events(provider)
         except Exception:
-            _error_context.chat = f'{provider}: очередь вебхуков'
+            _error_context.chat = None
+            try:
+                pending_event = storage.peek_next_webhook_event(provider)
+                if pending_event and isinstance(pending_event.get('payload'), dict):
+                    _error_context.chat = _event_chat_context(provider, pending_event['payload'])
+            except Exception as context_error:
+                logger.warning(
+                    'Could not resolve chat name for webhook queue error: provider=%s error=%s',
+                    provider, type(context_error).__name__
+                )
             _log_exception('Failed to claim webhook queue item: provider=%s', provider)
             _error_context.chat = None
             time.sleep(2)
